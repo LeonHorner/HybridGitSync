@@ -136,6 +136,7 @@ export class ApiBackend extends SyncBackend {
       } else {
         repoInfo = await this.apiRequest('GET', `/repos/${this.config.repo}`);
       }
+      this.log('isAvailable: repoInfo.default_branch =', repoInfo?.default_branch, '| config.branch =', this.config.branch);
       // Auto-detect default branch if not specified or invalid
       if (repoInfo.default_branch && this.config.branch !== repoInfo.default_branch) {
         this.log(`Auto-correcting branch: ${this.config.branch} → ${repoInfo.default_branch}`);
@@ -168,19 +169,16 @@ export class ApiBackend extends SyncBackend {
         );
         return !branches || (Array.isArray(branches) && branches.length === 0);
       }
-      // GitHub: a missing branch ref (404) or an empty-repo error (409) both
-      // mean the repo has no commits yet
-      await this.apiRequest('GET',
-        `/repos/${this.config.repo}/git/refs/heads/${this.config.branch}`,
-        undefined,
-        { silentNotFound: true }
+      // GitHub/Gitee: use branches list endpoint (avoids stale branch name issues)
+      const branches = await this.apiRequest('GET',
+        `/repos/${this.config.repo}/branches`
       );
-      return false; // Branch exists, repo is not empty
+      return !Array.isArray(branches) || branches.length === 0;
     } catch (error) {
       // 404 or 409 means empty repo (GitHub returns 409 "Git Repository is empty")
       const msg = (error as Error).message || '';
       if (msg.includes('404') || msg.includes('409')) {
-        this.log('Repository is empty (no branch refs found)');
+        this.log('Repository is empty (no branches found)');
         return true;
       }
       // Other errors (network, auth) -> rethrow
@@ -1951,13 +1949,13 @@ export class ApiBackend extends SyncBackend {
     try {
       let headSha: string;
 
-      if (this.config.provider === 'gitea') {
-        // Gitea has no Git Data API — use branches endpoint instead
+      if (this.config.provider === 'gitea' || this.config.provider === 'gitee') {
+        // Gitea/Gitee: git/refs endpoint may not work — use branches endpoint instead
         const branchData = await this.apiRequest<{ commit?: { sha?: string } }>('GET',
           `/repos/${this.config.repo}/branches/${this.config.branch}`,
           { silentNotFound: true }
         );
-        // Gitea uses commit.id, GitHub uses commit.sha
+        // Gitea uses commit.id, GitHub/Gitee use commit.sha
         headSha = branchData?.commit?.sha || (branchData?.commit as Record<string, unknown>)?.id as string || '';
         if (!headSha) {
           this.logger.warn('Branch API returned no commit SHA — treating as empty repo', {
