@@ -178,6 +178,7 @@ export default {
   'settings.customApiUrl': '自定义 API URL',
   'settings.customApiUrlDesc': '用于自托管实例（留空使用默认）',
   'settings.customApiUrlDescGitea': '自托管 Gitea 必填。请输入 Gitea API URL（例如 https://your-gitea.com/api/v1）',
+  'settings.customApiUrlDescGitee': 'Gitee API 基础 URL（例如 https://gitee.com/api/v5）。留空使用默认值。',
   'settings.customApiUrlDescGitlab': '自托管 GitLab 必填。请输入 GitLab API 基础 URL（例如 https://gitlab.com/api/v4 或 https://jihulab.com）',
   'settings.gitPath': 'Git 路径',
   'settings.gitPathDesc': 'Git 可执行文件路径（仅桌面端）',

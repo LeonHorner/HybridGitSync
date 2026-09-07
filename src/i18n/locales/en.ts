@@ -178,6 +178,7 @@ export default {
   'settings.customApiUrl': 'Custom API URL',
   'settings.customApiUrlDesc': 'For self-hosted instances (leave empty for default)',
   'settings.customApiUrlDescGitea': 'Required for self-hosted Gitea. Enter your Gitea API URL (e.g. https://your-gitea.com/api/v1)',
+  'settings.customApiUrlDescGitee': 'Base URL for Gitee API (e.g. https://gitee.com/api/v5). Leave empty for default.',
   'settings.customApiUrlDescGitlab': 'Required for self-hosted GitLab. Enter the GitLab API base URL (e.g. https://gitlab.com/api/v4 or https://jihulab.com)',
   'settings.gitPath': 'Git path',
   'settings.gitPathDesc': 'Path to git executable (desktop only)',

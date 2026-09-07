@@ -8,7 +8,7 @@ import { getErrorMessage, toError } from '../utils/error';
 import { isBinaryFile } from '../utils/binary';
 import { TempFileManager } from '../utils/temp-file';
 
-export type ApiProvider = 'github' | 'gitlab' | 'gitea';
+export type ApiProvider = 'github' | 'gitlab' | 'gitea' | 'gitee';
 
 interface ApiConfig {
   provider: ApiProvider;
@@ -232,7 +232,9 @@ export class ApiBackend extends SyncBackend {
     this.log('Creating .gitignore via Contents API...');
     try {
       // Don't specify branch - let GitHub/Gitea create the default branch automatically
-      const data = await this.apiRequest<{ content: { sha: string } }>('PUT',
+      // Gitee requires POST for new files (PUT requires sha), GitHub/Gitea accept PUT
+      const method = this.config.provider === 'gitee' ? 'POST' : 'PUT';
+      const data = await this.apiRequest<{ content: { sha: string } }>(method,
         `/repos/${this.config.repo}/contents/.gitignore`,
         {
           message: 'Initial commit',
@@ -1716,7 +1718,9 @@ export class ApiBackend extends SyncBackend {
           body.sha = existingSha;
         }
 
-        await this.apiRequest('PUT', `/repos/${this.config.repo}/contents/${file.path}`, body);
+        // Gitee: POST for new files (no sha), PUT for updates (with sha)
+        const method = this.config.provider === 'gitee' && !existingSha ? 'POST' : 'PUT';
+        await this.apiRequest(method, `/repos/${this.config.repo}/contents/${file.path}`, body);
       }
       return { success: true };
     } catch (e: unknown) {
@@ -1841,7 +1845,9 @@ export class ApiBackend extends SyncBackend {
     const maxRetries = 3;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        const data = await this.apiRequest<PutFileResponse>('PUT',
+        // Gitee: POST for new files (no sha), PUT for updates (with sha)
+        const method = this.config.provider === 'gitee' && !sha ? 'POST' : 'PUT';
+        const data = await this.apiRequest<PutFileResponse>(method,
           `/repos/${this.config.repo}/contents/${path}`, body
         );
         return data.content.sha;
@@ -2460,6 +2466,7 @@ export class ApiBackend extends SyncBackend {
       case 'github': return 'https://api.github.com';
       case 'gitlab': return 'https://gitlab.com/api/v4';
       case 'gitea': return 'https://gitea.com/api/v1';
+      case 'gitee': return 'https://gitee.com/api/v5';
     }
   }
 
@@ -2488,7 +2495,7 @@ export class ApiBackend extends SyncBackend {
       'Accept': 'application/json',
     };
 
-    if (this.config.provider === 'gitlab') {
+    if (this.config.provider === 'gitlab' || this.config.provider === 'gitee') {
       headers['Authorization'] = `Bearer ${this.config.token}`;
     }
 

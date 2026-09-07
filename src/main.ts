@@ -189,9 +189,9 @@ export default class HybridGitSyncPlugin extends Plugin {
         let remoteUrl = this.settings.remoteUrl;
         if (remoteUrl && !remoteUrl.startsWith('http') && !remoteUrl.startsWith('git@')) {
           // Use provider-specific base URL for short repo format
-          if (this.settings.apiProvider === 'gitea' && this.settings.apiBaseUrl) {
+          if ((this.settings.apiProvider === 'gitea' || this.settings.apiProvider === 'gitee') && this.settings.apiBaseUrl) {
             // Extract base domain from API URL (e.g., https://gitea.com/api/v1 -> gitea.com)
-            const apiDomain = this.settings.apiBaseUrl.replace('/api/v1', '').replace(/\/$/, '');
+            const apiDomain = this.settings.apiBaseUrl.replace(/\/api\/v[0-9]+$/, '').replace(/\/$/, '');
             remoteUrl = `${apiDomain}/${remoteUrl}.git`;
           } else if (this.settings.apiProvider === 'gitlab') {
             remoteUrl = `https://gitlab.com/${remoteUrl}.git`;
