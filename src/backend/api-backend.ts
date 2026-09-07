@@ -41,6 +41,28 @@ interface GitTreeResponse {
   tree: GitTreeItem[];
 }
 
+/** GitHub/Gitea/Gitee git ref response */
+interface GitRef {
+  object: { sha: string; type?: string };
+}
+
+/** GitLab tree item (uses `id` instead of `sha`) */
+interface GitLabTreeItem {
+  id: string;
+  name: string;
+  path: string;
+  type: 'tree' | 'blob';
+}
+
+/** GitHub/Gitea/Gitee contents list item */
+interface GitHubContentsItem {
+  name: string;
+  path: string;
+  sha: string;
+  size: number;
+  type: 'file' | 'dir';
+}
+
 interface CommitInfo {
   sha: string;
   message: string;
@@ -68,6 +90,20 @@ interface FileContent {
   encoding: string;
   content: string;
   sha: string;
+}
+
+/** GitHub file content response (includes download_url for large files) */
+interface GitHubFileContent extends FileContent {
+  download_url?: string;
+  size?: number;
+}
+
+/** GitLab file content response */
+interface GitLabFileContent {
+  content?: string;
+  encoding?: string;
+  blob_id?: string;
+  size?: number;
 }
 
 interface PutFileResponse {
@@ -130,11 +166,11 @@ export class ApiBackend extends SyncBackend {
       let repoInfo: RepoInfo;
       if (this.config.provider === 'gitlab') {
         // GitLab: project lookup by URL-encoded path (namespace%2Fproject)
-        repoInfo = await this.apiRequest('GET',
+        repoInfo = await this.apiRequest<RepoInfo>('GET',
           `/projects/${this.gitlabProjectId()}`
         );
       } else {
-        repoInfo = await this.apiRequest('GET', `/repos/${this.config.repo}`);
+        repoInfo = await this.apiRequest<RepoInfo>('GET', `/repos/${this.config.repo}`);
       }
       this.log('isAvailable: repoInfo.default_branch =', repoInfo?.default_branch, '| config.branch =', this.config.branch);
       // Auto-detect default branch when user hasn't explicitly configured one.
@@ -158,7 +194,7 @@ export class ApiBackend extends SyncBackend {
     try {
       if (this.config.provider === 'gitlab') {
         // GitLab: an empty repository has no branches
-        const branches = await this.apiRequest('GET',
+        const branches = await this.apiRequest<unknown[]>('GET',
           `/projects/${this.gitlabProjectId()}/repository/branches`
         );
         return Array.isArray(branches) && branches.length === 0;
@@ -166,19 +202,19 @@ export class ApiBackend extends SyncBackend {
       if (this.config.provider === 'gitea') {
         // Gitea has no Git Data API - check the branches endpoint instead
         // Gitea returns null (not []) for empty repos
-        const branches = await this.apiRequest('GET',
+        const branches = await this.apiRequest<unknown[]>('GET',
           `/repos/${this.config.repo}/branches`
         );
         return !branches || (Array.isArray(branches) && branches.length === 0);
       }
       // GitHub/Gitee: use branches list endpoint (avoids stale branch name issues)
-      const branches = await this.apiRequest('GET',
+      const branches = await this.apiRequest<unknown[]>('GET',
         `/repos/${this.config.repo}/branches`
       );
       return !Array.isArray(branches) || branches.length === 0;
     } catch (error) {
       // 404 or 409 means empty repo (GitHub returns 409 "Git Repository is empty")
-      const msg = (error as Error).message || '';
+      const msg = getErrorMessage(error);
       if (msg.includes('404') || msg.includes('409')) {
         this.log('Repository is empty (no branches found)');
         return true;
@@ -213,13 +249,13 @@ export class ApiBackend extends SyncBackend {
         message: t('repo.initialized'),
       };
     } catch (error) {
-      const errorMsg = (error as Error).message || String(error);
+      const errorMsg = getErrorMessage(error);
       console.error('[HybridGitSync] Failed to initialize repository:', errorMsg);
       console.error('[HybridGitSync] Full error:', error);
       return {
         success: false,
         message: t('repo.initFailed', { message: errorMsg }),
-        error: error as Error,
+        error: toError(error),
       };
     }
   }
@@ -521,7 +557,7 @@ export class ApiBackend extends SyncBackend {
           pushed++;
           remoteMap.delete(localPath); // Mark as processed
         } catch (e) {
-          const errMsg = `${localPath}: ${(e as Error).message}`;
+          const errMsg = `${localPath}: ${getErrorMessage(e)}`;
           console.error('[HybridGitSync] Error:', errMsg);
           errors.push(errMsg);
         }
@@ -536,7 +572,7 @@ export class ApiBackend extends SyncBackend {
           this.stateManager.removeRemoteSha(path);
           pushed++;
         } catch (e) {
-          errors.push(`delete ${path}: ${(e as Error).message}`);
+          errors.push(`delete ${path}: ${getErrorMessage(e)}`);
         }
       }
 
@@ -907,7 +943,7 @@ export class ApiBackend extends SyncBackend {
             }
           }
         } catch (e) {
-          errors.push(`compare ${path}: ${(e as Error).message}`);
+          errors.push(`compare ${path}: ${getErrorMessage(e)}`);
         }
       }
 
@@ -960,7 +996,7 @@ export class ApiBackend extends SyncBackend {
             pulled++;
             this.log('Downloaded:', path);
           } catch (e) {
-            const errMsg = `pull ${path}: ${(e as Error).message}`;
+            const errMsg = `pull ${path}: ${getErrorMessage(e)}`;
             errors.push(errMsg);
             console.error('[HybridGitSync]', errMsg);
           }
@@ -983,7 +1019,7 @@ export class ApiBackend extends SyncBackend {
           // Get current commit SHA - only GitHub's deletion flow needs it
           let currentCommitSha: string | undefined;
           if (this.config.provider === 'github') {
-            const refData = await this.apiRequest('GET',
+            const refData = await this.apiRequest<GitRef | GitRef[]>('GET',
               `/repos/${this.config.repo}/git/refs/heads/${this.config.branch}`
             );
             const branchInfo = (Array.isArray(refData) ? refData[0] : refData);
@@ -1013,7 +1049,7 @@ export class ApiBackend extends SyncBackend {
                 filesWithSize.push({ path, size });
               }
             } catch (e) {
-              errors.push(`size check ${path}: ${(e as Error).message}`);
+              errors.push(`size check ${path}: ${getErrorMessage(e)}`);
             }
           }
 
@@ -1071,7 +1107,7 @@ export class ApiBackend extends SyncBackend {
 
                   filesWithContent.push({ path: file.path, content, isBinary, contentHash });
                 } catch (e) {
-                  errors.push(`read ${file.path}: ${(e as Error).message}`);
+                  errors.push(`read ${file.path}: ${getErrorMessage(e)}`);
                 }
               }
 
@@ -1139,7 +1175,7 @@ export class ApiBackend extends SyncBackend {
 
                   filesWithContent.push({ path: file.path, content, isBinary, contentHash });
                 } catch (e) {
-                  errors.push(`read ${file.path}: ${(e as Error).message}`);
+                  errors.push(`read ${file.path}: ${getErrorMessage(e)}`);
                 }
               }
 
@@ -1198,7 +1234,7 @@ export class ApiBackend extends SyncBackend {
 
                 this.log(`Deletion complete (Git Data API): ${deleted} files deleted`);
               } catch (e) {
-                errors.push(`delete commit: ${(e as Error).message}`);
+                errors.push(`delete commit: ${getErrorMessage(e)}`);
               }
             }
           } else {
@@ -1228,7 +1264,7 @@ export class ApiBackend extends SyncBackend {
 
                   filesWithContent.push({ path: file.path, content, isBinary, contentHash });
                 } catch (e) {
-                  errors.push(`read ${file.path}: ${(e as Error).message}`);
+                  errors.push(`read ${file.path}: ${getErrorMessage(e)}`);
                 }
               }
 
@@ -1269,7 +1305,7 @@ export class ApiBackend extends SyncBackend {
                   deletedThisSync.add(path);
                   deleted++;
                 } catch (e) {
-                  errors.push(`delete ${path}: ${(e as Error).message}`);
+                  errors.push(`delete ${path}: ${getErrorMessage(e)}`);
                 }
               }
               this.log(`Deletion complete (Contents API): ${deleted} files deleted`);
@@ -1278,7 +1314,7 @@ export class ApiBackend extends SyncBackend {
 
           this.log(`Push complete: ${pushed} files pushed, ${deleted} files deleted`);
         } catch (e) {
-          const errMsg = `batch push: ${(e as Error).message}`;
+          const errMsg = `batch push: ${getErrorMessage(e)}`;
           errors.push(errMsg);
           console.error('[HybridGitSync]', errMsg);
         }
@@ -1293,7 +1329,7 @@ export class ApiBackend extends SyncBackend {
           deleted++;
           this.log('Deleted locally:', path);
         } catch (e) {
-          errors.push(`delete local ${path}: ${(e as Error).message}`);
+          errors.push(`delete local ${path}: ${getErrorMessage(e)}`);
         }
       }
 
@@ -1483,9 +1519,9 @@ export class ApiBackend extends SyncBackend {
         return await this.getGitlabFile(path);
       }
 
-      const data = await this.apiRequest('GET',
+      const data = await this.apiRequest<GitHubFileContent>('GET',
         `/repos/${this.config.repo}/contents/${path}?ref=${this.config.branch}`
-      ) as FileContent & { download_url?: string; size?: number };
+      );
       if (data.type !== 'file') return null;
 
       const isBinary = isBinaryFile(path);
@@ -1584,9 +1620,9 @@ export class ApiBackend extends SyncBackend {
     const encodedPath = encodeURIComponent(path);
     const isBinary = isBinaryFile(path);
 
-    const data = await this.apiRequest('GET',
+    const data = await this.apiRequest<GitLabFileContent>('GET',
       `/projects/${projectId}/repository/files/${encodedPath}?ref=${encodeURIComponent(this.config.branch)}`
-    ) as { content?: string; encoding?: string; blob_id?: string; size?: number };
+    );
 
     let content: string | ArrayBuffer;
     // Estimated decoded length of the inline base64 content (complete = size)
@@ -1858,7 +1894,7 @@ export class ApiBackend extends SyncBackend {
         );
         return data.content.sha;
       } catch (error) {
-        const msg = (error as Error).message || '';
+        const msg = getErrorMessage(error);
         if (msg.includes('409') && attempt < maxRetries - 1) {
           // Wait before retry (exponential backoff: 1s, 2s, 4s)
           const delay = Math.pow(2, attempt) * 1000;
@@ -1900,28 +1936,28 @@ export class ApiBackend extends SyncBackend {
         // GitLab Tree API (non-recursive): item id is the git object SHA
         const query = `ref=${encodeURIComponent(this.config.branch)}` +
           (path ? `&path=${encodeURIComponent(path)}` : '');
-        const data = await this.apiRequest('GET',
+        const data = await this.apiRequest<GitLabTreeItem[]>('GET',
           `/projects/${this.gitlabProjectId()}/repository/tree?${query}`
         );
         if (!Array.isArray(data)) return [];
         return data.map((item) => ({
-          name: item.name as string,
-          path: item.path as string,
-          sha: item.id as string,
+          name: item.name,
+          path: item.path,
+          sha: item.id,
           size: 0,
           type: item.type === 'tree' ? 'dir' : 'file',
         }));
       }
-      const data = await this.apiRequest('GET',
+      const data = await this.apiRequest<GitHubContentsItem[]>('GET',
         `/repos/${this.config.repo}/contents/${path}?ref=${this.config.branch}`
       );
       if (!Array.isArray(data)) return [];
       return data.map((item) => ({
-        name: item.name as string,
-        path: item.path as string,
-        sha: item.sha as string,
-        size: item.size as number,
-        type: item.type as 'file' | 'dir',
+        name: item.name,
+        path: item.path,
+        sha: item.sha,
+        size: item.size,
+        type: item.type,
       }));
     } catch {
       return [];
@@ -1975,7 +2011,7 @@ export class ApiBackend extends SyncBackend {
         }
       } else {
         // GitHub: use Git Data API
-        const refData = await this.apiRequest('GET',
+        const refData = await this.apiRequest<GitRef | GitRef[]>('GET',
           `/repos/${this.config.repo}/git/refs/heads/${this.config.branch}`
         );
         const branchInfo = (Array.isArray(refData) ? refData[0] : refData);
@@ -2003,7 +2039,7 @@ export class ApiBackend extends SyncBackend {
     } catch (error) {
       // 404 or 409 means empty repo (no branch refs) - return empty map
       // GitHub returns 409 "Git Repository is empty" for empty repos
-      const msg = (error as Error).message || '';
+      const msg = getErrorMessage(error);
       if (msg.includes('404') || msg.includes('409')) {
         this.logger.warn('Remote tree request failed — treating as empty repo', {
           repo: this.config.repo,
@@ -2033,7 +2069,7 @@ export class ApiBackend extends SyncBackend {
       );
       headSha = branchData?.commit?.id || '';
     } catch (error) {
-      const msg = (error as Error).message || '';
+      const msg = getErrorMessage(error);
       if (!msg.includes('404')) throw error;
       this.log('Remote tree: empty repository (no branches)');
       return { tree: fileMap, headSha: '' };
@@ -2041,13 +2077,13 @@ export class ApiBackend extends SyncBackend {
 
     const MAX_PAGES = 1000;
     for (let page = 1; page <= MAX_PAGES; page++) {
-      const items = await this.apiRequest('GET',
+      const items = await this.apiRequest<GitLabTreeItem[]>('GET',
         `/projects/${projectId}/repository/tree?ref=${encodeURIComponent(this.config.branch)}&recursive=true&per_page=100&page=${page}`
       );
       if (!Array.isArray(items)) break;
       for (const item of items) {
         if (item.type === 'blob') {
-          fileMap.set(item.path as string, item.id as string);
+          fileMap.set(item.path, item.id);
         }
       }
       if (items.length < 100) break;
