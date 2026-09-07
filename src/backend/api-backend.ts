@@ -137,9 +137,11 @@ export class ApiBackend extends SyncBackend {
         repoInfo = await this.apiRequest('GET', `/repos/${this.config.repo}`);
       }
       this.log('isAvailable: repoInfo.default_branch =', repoInfo?.default_branch, '| config.branch =', this.config.branch);
-      // Auto-detect default branch if not specified or invalid
-      if (repoInfo.default_branch && this.config.branch !== repoInfo.default_branch) {
-        this.log(`Auto-correcting branch: ${this.config.branch} → ${repoInfo.default_branch}`);
+      // Auto-detect default branch when user hasn't explicitly configured one.
+      // Default settings use 'main' — if the branch is still 'main' or empty,
+      // adopt the remote's actual default. A custom value (e.g. 'dev') is kept.
+      if (repoInfo.default_branch && (!this.config.branch || this.config.branch === 'main')) {
+        this.log(`Auto-detecting branch: → ${repoInfo.default_branch}`);
         this.config.branch = repoInfo.default_branch;
       }
       return true;
@@ -229,23 +231,29 @@ export class ApiBackend extends SyncBackend {
     // Use Contents API to create .gitignore - this auto-creates the default branch
     this.log('Creating .gitignore via Contents API...');
     try {
-      // Don't specify branch - let GitHub/Gitea create the default branch automatically
+      // Use configured branch, or let the platform create the default branch
       // Gitee requires POST for new files (PUT requires sha), GitHub/Gitea accept PUT
       const method = this.config.provider === 'gitee' ? 'POST' : 'PUT';
+      const body: Record<string, unknown> = {
+        message: 'Initial commit',
+        content: base64Content,
+      };
+      if (this.config.branch) {
+        body.branch = this.config.branch;
+      }
       const data = await this.apiRequest<{ content: { sha: string } }>(method,
         `/repos/${this.config.repo}/contents/.gitignore`,
-        {
-          message: 'Initial commit',
-          content: base64Content,
-        }
+        body
       );
       this.log('Created .gitignore, sha:', data.content.sha);
 
-      // Now detect the actual default branch
-      const repoInfo = await this.apiRequest<RepoInfo>('GET', `/repos/${this.config.repo}`);
-      if (repoInfo.default_branch) {
-        this.config.branch = repoInfo.default_branch;
-        this.log('Detected default branch:', this.config.branch);
+      // If no branch was configured, detect the default branch now
+      if (!this.config.branch) {
+        const repoInfo = await this.apiRequest<RepoInfo>('GET', `/repos/${this.config.repo}`);
+        if (repoInfo.default_branch) {
+          this.config.branch = repoInfo.default_branch;
+          this.log('Detected default branch:', this.config.branch);
+        }
       }
     } catch (error) {
       console.error('[HybridGitSync] Error in initializeGithubGiteaRepo:', error);
