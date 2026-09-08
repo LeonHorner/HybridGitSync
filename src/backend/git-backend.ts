@@ -289,8 +289,8 @@ export class GitBackend extends SyncBackend {
     // (isGitAvailable in main.ts) checks Platform.isDesktop first.
     // child_process is listed in esbuild "external" so it is never
     // bundled; require() resolves it from Electron's Node.js runtime.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { exec } = require('child_process');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- require() is safe here: only called on desktop, child_process is in esbuild external
+    const { exec } = require('child_process') as typeof import('child_process');
     return new Promise((resolve, reject) => {
       // Build environment with token for authentication
       const env = { ...process.env };
@@ -307,7 +307,7 @@ export class GitBackend extends SyncBackend {
       exec(`${this.gitPath} ${args}`, {
         cwd: this.vaultPath,
         env,
-      }, (error, stdout, stderr) => {
+      }, (error: Error | null, stdout: string, stderr: string) => {
         if (error) {
           reject(new Error(`${error.message}\n${stderr}`));
         } else {
