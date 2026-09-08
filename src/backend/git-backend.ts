@@ -2,6 +2,7 @@ import { FileSystemAdapter, Vault } from 'obsidian';
 import { SyncBackend, SyncResult, SyncStatus, FileChange } from './base';
 import { t } from '../i18n';
 import { getErrorMessage, toError } from '../utils/error';
+import { Logger, LogLevel } from '../utils/logger';
 
 export class GitBackend extends SyncBackend {
   readonly name = 'git';
@@ -10,8 +11,10 @@ export class GitBackend extends SyncBackend {
   private remoteUrl: string;
   private token: string;
   private commitMessage: string;
+  private debug: boolean;
+  private logger: Logger;
 
-  constructor(vault: Vault, gitPath: string = 'git', remoteUrl: string = '', token: string = '', commitMessage?: string) {
+  constructor(vault: Vault, gitPath: string = 'git', remoteUrl: string = '', token: string = '', commitMessage?: string, debug = false) {
     super();
     // The vault's absolute path lives on the desktop-only FileSystemAdapter
     this.vaultPath = vault.adapter instanceof FileSystemAdapter ? vault.adapter.getBasePath() : '';
@@ -19,6 +22,20 @@ export class GitBackend extends SyncBackend {
     this.remoteUrl = remoteUrl;
     this.token = token;
     this.commitMessage = commitMessage || '';
+    this.debug = debug;
+    this.logger = new Logger('GitBackend', debug ? LogLevel.DEBUG : LogLevel.INFO);
+    this.log('GitBackend created', {
+      vaultPath: this.vaultPath,
+      gitPath: this.gitPath,
+      remoteUrl: this.remoteUrl,
+      hasToken: !!this.token,
+    });
+  }
+
+  private log(...args: unknown[]): void {
+    if (this.debug) {
+      this.logger.info(...args);
+    }
   }
 
   /**
@@ -56,16 +73,19 @@ export class GitBackend extends SyncBackend {
 
   async isAvailable(): Promise<boolean> {
     try {
-      await this.exec('--version');
+      const version = (await this.exec('--version')).trim();
+      this.log('isAvailable: git version =', version);
+
       // Check if current directory is a git repo
-      await this.exec('rev-parse --is-inside-work-tree');
+      const isInsideWorkTree = (await this.exec('rev-parse --is-inside-work-tree')).trim();
+      this.log('isAvailable: isInsideWorkTree =', isInsideWorkTree, ', vaultPath =', this.vaultPath);
 
       // Auto-configure remote if remoteUrl is provided
       if (this.remoteUrl) {
         try {
           const remotes = await this.exec('remote -v');
           if (!remotes.trim()) {
-            // No remote configured, add origin
+            this.log('isAvailable: No remote configured, adding origin:', this.remoteUrl);
             await this.exec(`remote add origin ${this.remoteUrl}`);
           }
           // Always update URL with token for authentication
@@ -75,27 +95,34 @@ export class GitBackend extends SyncBackend {
               `https://x-access-token:${this.token}@`
             );
             await this.exec(`remote set-url origin ${authUrl}`);
+            this.log('isAvailable: Updated remote URL with token');
           }
-        } catch {
-          // Ignore remote config errors
+        } catch (error) {
+          this.log('isAvailable: Remote config error (ignored):', getErrorMessage(error));
         }
       }
 
+      this.log('isAvailable: Git backend is available');
       return true;
-    } catch {
+    } catch (error) {
+      this.logger.warn('isAvailable: Git backend not available:', getErrorMessage(error));
       return false;
     }
   }
 
   async pull(): Promise<SyncResult> {
     try {
+      this.log('pull: Pulling from remote...');
       const output = await this.exec('pull --no-rebase');
+      const pulled = this.countChanges(output);
+      this.log('pull: Success, pulled', pulled, 'files');
       return {
         success: true,
         message: output.trim(),
-        pulled: this.countChanges(output),
+        pulled,
       };
     } catch (error) {
+      this.logger.warn('pull: Pull failed:', getErrorMessage(error));
       return {
         success: false,
         message: 'Pull failed',
@@ -107,6 +134,7 @@ export class GitBackend extends SyncBackend {
   async push(): Promise<SyncResult> {
     try {
       const branch = (await this.exec('rev-parse --abbrev-ref HEAD')).trim();
+      this.log('push: Current branch:', branch);
 
       // Check if upstream is already set
       let hasUpstream = false;
@@ -116,17 +144,22 @@ export class GitBackend extends SyncBackend {
       } catch {
         // No upstream set
       }
+      this.log('push: Has upstream:', hasUpstream);
 
       // Use -u flag only if upstream is not set
       const pushCmd = hasUpstream ? 'push' : `push -u origin ${branch}`;
+      this.log('push: Executing:', pushCmd);
       const output = await this.exec(pushCmd);
 
+      const pushed = this.countChanges(output);
+      this.log('push: Success, pushed', pushed, 'files');
       return {
         success: true,
         message: output.trim(),
-        pushed: this.countChanges(output),
+        pushed,
       };
     } catch (error) {
+      this.logger.warn('push: Push failed:', getErrorMessage(error));
       return {
         success: false,
         message: `Push failed: ${getErrorMessage(error)}`,
@@ -148,9 +181,12 @@ export class GitBackend extends SyncBackend {
 
   async sync(): Promise<SyncResult> {
     try {
+      this.log('sync: Starting git sync...');
+
       // Step 0: Check git state before syncing
       const stateCheck = await this.checkGitState();
       if (!stateCheck.ok) {
+        this.log('sync: Git state check failed:', stateCheck.message);
         return {
           success: false,
           message: stateCheck.message,
@@ -159,20 +195,29 @@ export class GitBackend extends SyncBackend {
       }
 
       // Step 1: Stage all changes
+      this.log('sync: Staging all changes...');
       await this.exec('add -A');
 
       // Step 2: Check if there are changes to commit
       const status = await this.exec('status --porcelain');
+      const changedFiles = status.trim().split('\n').filter(line => line.trim());
+      this.log('sync: Changed files:', changedFiles.length);
+
       if (status.trim()) {
         const message = this.buildCommitMessage();
         // Escape double quotes in the message for shell safety
         const safeMessage = message.replace(/"/g, '\\"');
+        this.log('sync: Committing with message:', message);
         await this.exec(`commit -m "${safeMessage}"`);
+      } else {
+        this.log('sync: No changes to commit');
       }
 
       // Step 3: Try to pull with merge (skip if remote is empty or no upstream)
+      this.log('sync: Pulling from remote...');
       try {
-        await this.exec('pull --no-rebase');
+        const pullOutput = await this.exec('pull --no-rebase');
+        this.log('sync: Pull result:', pullOutput.trim());
       } catch (pullError) {
         // Remote might be empty or no upstream set — that's OK for first push
         const msg = (pullError as Error).message;
@@ -180,16 +225,20 @@ export class GitBackend extends SyncBackend {
             msg.includes('no upstream') ||
             msg.includes('fatal: couldn\'t find remote ref') ||
             msg.includes('There is no tracking information')) {
-          // This is fine, just push
+          this.log('sync: No upstream or empty remote, will push');
         } else {
+          this.logger.warn('sync: Pull failed:', msg);
           throw pullError; // Re-throw other errors
         }
       }
 
       // Step 4: Push
+      this.log('sync: Pushing to remote...');
       const pushResult = await this.push();
+      this.log('sync: Push result:', pushResult);
       return pushResult;
     } catch (error) {
+      this.logger.error('sync: Sync failed:', getErrorMessage(error));
       return {
         success: false,
         message: `Sync failed: ${getErrorMessage(error)}`,
@@ -243,6 +292,7 @@ export class GitBackend extends SyncBackend {
     try {
       // Get current branch
       const branch = (await this.exec('rev-parse --abbrev-ref HEAD')).trim();
+      this.log('status: Current branch:', branch);
 
       // Get ahead/behind counts
       let ahead = 0, behind = 0;
@@ -251,19 +301,26 @@ export class GitBackend extends SyncBackend {
         const [a, b] = counts.trim().split('\t').map(Number);
         ahead = a || 0;
         behind = b || 0;
+        this.log('status: Ahead:', ahead, ', Behind:', behind);
       } catch {
         // No upstream configured
+        this.log('status: No upstream configured');
       }
 
       // Get changed files
       const statusOutput = await this.exec('status --porcelain');
       const changedFiles = this.parseStatus(statusOutput);
+      this.log('status: Changed files:', changedFiles.length);
 
       // Check for conflicts
       const hasConflicts = statusOutput.includes('UU') || statusOutput.includes('AA');
+      if (hasConflicts) {
+        this.log('status: Conflicts detected');
+      }
 
       return { ahead, behind, changedFiles, branch, hasConflicts };
-    } catch {
+    } catch (error) {
+      this.logger.warn('status: Failed to get status:', getErrorMessage(error));
       return {
         ahead: 0,
         behind: 0,
