@@ -1,4 +1,4 @@
-import { EventRef, Notice, Plugin, TFile } from 'obsidian';
+import { EventRef, Notice, Platform, Plugin, TFile } from 'obsidian';
 import { PluginSettings, SettingsTab, DEFAULT_SETTINGS, ConfirmModal } from './settings';
 import { getErrorMessage } from './utils/error';
 import { SyncBackend } from './backend/base';
@@ -274,11 +274,18 @@ export default class HybridGitSyncPlugin extends Plugin {
    * Check if git is available and vault is a git repository
    */
   private async isGitAvailable(): Promise<boolean> {
+    // Mobile platform cannot use native git
+    this.log('isGitAvailable: Platform.isDesktop =', Platform.isDesktop, ', Platform.isMobile =', Platform.isMobile);
+    if (!Platform.isDesktop) return false;
+
     try {
       // Create a temporary GitBackend to check availability
       const tempBackend = new GitBackend(this.app.vault, this.settings.gitPath);
-      return await tempBackend.isAvailable();
-    } catch {
+      const available = await tempBackend.isAvailable();
+      this.log('isGitAvailable: GitBackend.isAvailable =', available);
+      return available;
+    } catch (error) {
+      this.log('isGitAvailable: error', error);
       return false;
     }
   }

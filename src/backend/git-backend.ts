@@ -1,4 +1,4 @@
-import { FileSystemAdapter, Platform, Vault } from 'obsidian';
+import { FileSystemAdapter, Vault } from 'obsidian';
 import { SyncBackend, SyncResult, SyncStatus, FileChange } from './base';
 import { t } from '../i18n';
 import { getErrorMessage, toError } from '../utils/error';
@@ -285,12 +285,12 @@ export class GitBackend extends SyncBackend {
   }
 
   async exec(args: string): Promise<string> {
-    // child_process is a desktop-only Node API; import it lazily so the
-    // mobile bundle never loads it (this backend only runs on desktop)
-    if (!Platform.isDesktop) {
-      throw new Error('Native git backend requires Obsidian desktop');
-    }
-    const { exec } = await import('child_process');
+    // SAFETY: This method is only called on desktop — the caller
+    // (isGitAvailable in main.ts) checks Platform.isDesktop first.
+    // child_process is listed in esbuild "external" so it is never
+    // bundled; require() resolves it from Electron's Node.js runtime.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { exec } = require('child_process');
     return new Promise((resolve, reject) => {
       // Build environment with token for authentication
       const env = { ...process.env };
