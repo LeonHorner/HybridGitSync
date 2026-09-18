@@ -1,4 +1,4 @@
-import { requestUrl, RequestUrlResponse, Vault } from 'obsidian';
+import { requestUrl, RequestUrlParam, RequestUrlResponse, Vault } from 'obsidian';
 import { SyncBackend, SyncResult, SyncStatus, FileChange } from './base';
 import { SyncStateManager } from '../sync/state';
 import { GitignoreRules } from '../utils/gitignore';
@@ -268,8 +268,8 @@ export class ApiBackend extends SyncBackend {
     this.log('Creating .gitignore via Contents API...');
     try {
       // Use configured branch, or let the platform create the default branch
-      // Gitee requires POST for new files (PUT requires sha), GitHub/Gitea accept PUT
-      const method = this.isGiteaLike() ? 'POST' : 'PUT';
+      // All platforms: POST for creation, PUT for update
+      const method = 'POST';
       const body: Record<string, unknown> = {
         message: 'Initial commit',
         content: base64Content,
@@ -319,13 +319,6 @@ export class ApiBackend extends SyncBackend {
 
   // ===== Git Data API Methods =====
 
-  private isGiteaLike(): boolean {
-    return (
-      this.config.provider === "gitea" ||
-      this.config.provider === "gitee" ||
-      (!!this.baseUrl && (this.baseUrl.includes("/api/v1") || this.baseUrl.includes("forgejo") || this.baseUrl.includes("gitea")))
-    );
-  }
   /**
    * Create a blob for a file content
    */
@@ -1767,8 +1760,8 @@ export class ApiBackend extends SyncBackend {
           body.sha = existingSha;
         }
 
-        // Gitee: POST for new files (no sha), PUT for updates (with sha)
-        const method = this.isGiteaLike() && !existingSha ? 'POST' : 'PUT';
+        // All platforms: POST for creation, PUT for update
+        const method = !existingSha ? 'POST' : 'PUT';
         await this.apiRequest(method, `/repos/${this.config.repo}/contents/${file.path}`, body);
       }
       return { success: true };
@@ -1894,8 +1887,8 @@ export class ApiBackend extends SyncBackend {
     const maxRetries = 3;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        // Gitee: POST for new files (no sha), PUT for updates (with sha)
-        const method = this.isGiteaLike() && !sha ? 'POST' : 'PUT';
+        // All platforms: POST for creation, PUT for update
+        const method = !sha ? 'POST' : 'PUT';
         const data = await this.apiRequest<PutFileResponse>(method,
           `/repos/${this.config.repo}/contents/${path}`, body
         );
