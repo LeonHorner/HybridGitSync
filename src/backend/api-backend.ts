@@ -269,7 +269,7 @@ export class ApiBackend extends SyncBackend {
     try {
       // Use configured branch, or let the platform create the default branch
       // Gitee requires POST for new files (PUT requires sha), GitHub/Gitea accept PUT
-      const method = this.config.provider === 'gitee' ? 'POST' : 'PUT';
+      const method = this.isGiteaLike() ? 'POST' : 'PUT';
       const body: Record<string, unknown> = {
         message: 'Initial commit',
         content: base64Content,
@@ -319,6 +319,13 @@ export class ApiBackend extends SyncBackend {
 
   // ===== Git Data API Methods =====
 
+  private isGiteaLike(): boolean {
+    return (
+      this.config.provider === "gitea" ||
+      this.config.provider === "gitee" ||
+      (!!this.baseUrl && (this.baseUrl.includes("/api/v1") || this.baseUrl.includes("forgejo") || this.baseUrl.includes("gitea")))
+    );
+  }
   /**
    * Create a blob for a file content
    */
@@ -1761,7 +1768,7 @@ export class ApiBackend extends SyncBackend {
         }
 
         // Gitee: POST for new files (no sha), PUT for updates (with sha)
-        const method = this.config.provider === 'gitee' && !existingSha ? 'POST' : 'PUT';
+        const method = this.isGiteaLike() && !existingSha ? 'POST' : 'PUT';
         await this.apiRequest(method, `/repos/${this.config.repo}/contents/${file.path}`, body);
       }
       return { success: true };
@@ -1888,7 +1895,7 @@ export class ApiBackend extends SyncBackend {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         // Gitee: POST for new files (no sha), PUT for updates (with sha)
-        const method = this.config.provider === 'gitee' && !sha ? 'POST' : 'PUT';
+        const method = this.isGiteaLike() && !sha ? 'POST' : 'PUT';
         const data = await this.apiRequest<PutFileResponse>(method,
           `/repos/${this.config.repo}/contents/${path}`, body
         );
@@ -2542,13 +2549,17 @@ export class ApiBackend extends SyncBackend {
     }
 
     try {
-      const response: RequestUrlResponse = await requestUrl({
+      const requestOpts: RequestUrlParam = {
         url,
         method,
         headers,
         body: body ? JSON.stringify(body) : undefined,
-        throw: false,
-      });
+        throw: false
+      };
+      if (method === "GET" || method === "HEAD") {
+        delete requestOpts.body;
+      }
+      const response = await requestUrl(requestOpts);
 
       this.log('apiRequest response status:', response.status);
 
