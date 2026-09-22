@@ -1,4 +1,4 @@
-import { FileSystemAdapter, Vault } from 'obsidian';
+import { FileSystemAdapter, Platform, Vault } from 'obsidian';
 import { SyncBackend, SyncResult, SyncStatus, FileChange } from './base';
 import { t } from '../i18n';
 import { getErrorMessage, toError } from '../utils/error';
@@ -7,7 +7,9 @@ import { Logger, LogLevel } from '../utils/logger';
 export class GitBackend extends SyncBackend {
   readonly name = 'git';
   private vaultPath: string;
-  private gitPath: string;
+  private configuredGitPath: string;
+  private resolvedGitPath: string | null = null;
+  private resolvePromise: Promise<string> | null = null;
   private remoteUrl: string;
   private token: string;
   private commitMessage: string;
@@ -18,7 +20,7 @@ export class GitBackend extends SyncBackend {
     super();
     // The vault's absolute path lives on the desktop-only FileSystemAdapter
     this.vaultPath = vault.adapter instanceof FileSystemAdapter ? vault.adapter.getBasePath() : '';
-    this.gitPath = gitPath;
+    this.configuredGitPath = gitPath;
     this.remoteUrl = remoteUrl;
     this.token = token;
     this.commitMessage = commitMessage || '';
@@ -26,10 +28,14 @@ export class GitBackend extends SyncBackend {
     this.logger = new Logger('GitBackend', debug ? LogLevel.DEBUG : LogLevel.INFO);
     this.log('GitBackend created', {
       vaultPath: this.vaultPath,
-      gitPath: this.gitPath,
+      gitPath: this.configuredGitPath,
       remoteUrl: this.remoteUrl,
       hasToken: !!this.token,
     });
+  }
+
+  get gitPath(): string {
+    return this.resolvedGitPath ?? this.configuredGitPath;
   }
 
   private log(...args: unknown[]): void {
@@ -43,7 +49,7 @@ export class GitBackend extends SyncBackend {
    */
   async getRemoteUrl(): Promise<string | null> {
     try {
-      const url = await this.exec('remote get-url origin');
+      const url = await this.exec(['remote', 'get-url', 'origin']);
       return url.trim() || null;
     } catch {
       return null;
@@ -55,7 +61,7 @@ export class GitBackend extends SyncBackend {
    */
   async getCurrentBranch(): Promise<string | null> {
     try {
-      const branch = await this.exec('rev-parse --abbrev-ref HEAD');
+      const branch = await this.exec(['rev-parse', '--abbrev-ref', 'HEAD']);
       return branch.trim() || null;
     } catch {
       return null;
@@ -73,20 +79,20 @@ export class GitBackend extends SyncBackend {
 
   async isAvailable(): Promise<boolean> {
     try {
-      const version = (await this.exec('--version')).trim();
+      const version = (await this.exec(['--version'])).trim();
       this.log('isAvailable: git version =', version);
 
       // Check if current directory is a git repo
-      const isInsideWorkTree = (await this.exec('rev-parse --is-inside-work-tree')).trim();
+      const isInsideWorkTree = (await this.exec(['rev-parse', '--is-inside-work-tree'])).trim();
       this.log('isAvailable: isInsideWorkTree =', isInsideWorkTree, ', vaultPath =', this.vaultPath);
 
       // Auto-configure remote if remoteUrl is provided
       if (this.remoteUrl) {
         try {
-          const remotes = await this.exec('remote -v');
+          const remotes = await this.exec(['remote', '-v']);
           if (!remotes.trim()) {
             this.log('isAvailable: No remote configured, adding origin:', this.remoteUrl);
-            await this.exec(`remote add origin ${this.remoteUrl}`);
+            await this.exec(['remote', 'add', 'origin', this.remoteUrl]);
           }
           // Always update URL with token for authentication
           if (this.token) {
@@ -94,7 +100,7 @@ export class GitBackend extends SyncBackend {
               'https://',
               `https://x-access-token:${this.token}@`
             );
-            await this.exec(`remote set-url origin ${authUrl}`);
+            await this.exec(['remote', 'set-url', 'origin', authUrl]);
             this.log('isAvailable: Updated remote URL with token');
           }
         } catch (error) {
@@ -113,7 +119,7 @@ export class GitBackend extends SyncBackend {
   async pull(): Promise<SyncResult> {
     try {
       this.log('pull: Pulling from remote...');
-      const output = await this.exec('pull --no-rebase');
+      const output = await this.exec(['pull', '--no-rebase']);
       const pulled = this.countChanges(output);
       this.log('pull: Success, pulled', pulled, 'files');
       return {
@@ -133,13 +139,13 @@ export class GitBackend extends SyncBackend {
 
   async push(): Promise<SyncResult> {
     try {
-      const branch = (await this.exec('rev-parse --abbrev-ref HEAD')).trim();
+      const branch = (await this.exec(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
       this.log('push: Current branch:', branch);
 
       // Check if upstream is already set
       let hasUpstream = false;
       try {
-        await this.exec(`rev-parse --abbrev-ref ${branch}@{upstream}`);
+        await this.exec(['rev-parse', '--abbrev-ref', `${branch}@{upstream}`]);
         hasUpstream = true;
       } catch {
         // No upstream set
@@ -147,9 +153,9 @@ export class GitBackend extends SyncBackend {
       this.log('push: Has upstream:', hasUpstream);
 
       // Use -u flag only if upstream is not set
-      const pushCmd = hasUpstream ? 'push' : `push -u origin ${branch}`;
-      this.log('push: Executing:', pushCmd);
-      const output = await this.exec(pushCmd);
+      const pushArgs = hasUpstream ? ['push'] : ['push', '-u', 'origin', branch];
+      this.log('push: Executing:', pushArgs.join(' '));
+      const output = await this.exec(pushArgs);
 
       const pushed = this.countChanges(output);
       this.log('push: Success, pushed', pushed, 'files');
@@ -196,19 +202,17 @@ export class GitBackend extends SyncBackend {
 
       // Step 1: Stage all changes
       this.log('sync: Staging all changes...');
-      await this.exec('add -A');
+      await this.exec(['add', '-A']);
 
       // Step 2: Check if there are changes to commit
-      const status = await this.exec('status --porcelain');
+      const status = await this.exec(['status', '--porcelain']);
       const changedFiles = status.trim().split('\n').filter(line => line.trim());
       this.log('sync: Changed files:', changedFiles.length);
 
       if (status.trim()) {
         const message = this.buildCommitMessage();
-        // Escape double quotes in the message for shell safety
-        const safeMessage = message.replace(/"/g, '\\"');
         this.log('sync: Committing with message:', message);
-        await this.exec(`commit -m "${safeMessage}"`);
+        await this.exec(['commit', '-m', message]);
       } else {
         this.log('sync: No changes to commit');
       }
@@ -216,7 +220,7 @@ export class GitBackend extends SyncBackend {
       // Step 3: Try to pull with merge (skip if remote is empty or no upstream)
       this.log('sync: Pulling from remote...');
       try {
-        const pullOutput = await this.exec('pull --no-rebase');
+        const pullOutput = await this.exec(['pull', '--no-rebase']);
         this.log('sync: Pull result:', pullOutput.trim());
       } catch (pullError) {
         // Remote might be empty or no upstream set — that's OK for first push
@@ -252,7 +256,7 @@ export class GitBackend extends SyncBackend {
    */
   private async checkGitState(): Promise<{ ok: boolean; message: string }> {
     try {
-      const status = await this.exec('status');
+      const status = await this.exec(['status']);
 
       // Check for rebase in progress
       if (status.includes('rebase') || status.includes('REBASE')) {
@@ -291,13 +295,13 @@ export class GitBackend extends SyncBackend {
   async status(): Promise<SyncStatus> {
     try {
       // Get current branch
-      const branch = (await this.exec('rev-parse --abbrev-ref HEAD')).trim();
+      const branch = (await this.exec(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
       this.log('status: Current branch:', branch);
 
       // Get ahead/behind counts
       let ahead = 0, behind = 0;
       try {
-        const counts = await this.exec('rev-list --left-right --count HEAD...@{upstream}');
+        const counts = await this.exec(['rev-list', '--left-right', '--count', 'HEAD...@{upstream}']);
         const [a, b] = counts.trim().split('\t').map(Number);
         ahead = a || 0;
         behind = b || 0;
@@ -308,7 +312,7 @@ export class GitBackend extends SyncBackend {
       }
 
       // Get changed files
-      const statusOutput = await this.exec('status --porcelain');
+      const statusOutput = await this.exec(['status', '--porcelain']);
       const changedFiles = this.parseStatus(statusOutput);
       this.log('status: Changed files:', changedFiles.length);
 
@@ -341,13 +345,160 @@ export class GitBackend extends SyncBackend {
     // Nothing to dispose for native git
   }
 
-  async exec(args: string): Promise<string> {
-    // SAFETY: This method is only called on desktop — the caller
-    // (isGitAvailable in main.ts) checks Platform.isDesktop first.
-    // child_process is listed in esbuild "external" so it is never
-    // bundled; require() resolves it from Electron's Node.js runtime.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- require() is safe here: only called on desktop, child_process is in esbuild external
-    const { exec } = require('child_process') as typeof import('child_process');
+  private getExecFile(): typeof import('child_process').execFile {
+    // SAFETY: This method is only called on desktop — callers check Platform.isDesktop first.
+    // child_process is listed in esbuild "external" so it is never bundled;
+    // require() resolves it from Electron's Node.js runtime.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const cp = require('child_process');
+    return cp.execFile;
+  }
+
+  private getPlatform(): 'win32' | 'darwin' | 'linux' | 'other' {
+    if (typeof process !== 'undefined' && process.platform) {
+      if (process.platform === 'win32') return 'win32';
+      if (process.platform === 'darwin') return 'darwin';
+      if (process.platform === 'linux') return 'linux';
+    }
+    if (Platform.isWin) return 'win32';
+    if (Platform.isMacOS) return 'darwin';
+    if (Platform.isLinux) return 'linux';
+    return 'other';
+  }
+
+  private getCandidatePaths(): { isExplicit: boolean; candidates: string[] } {
+    const raw = this.configuredGitPath ?? '';
+    let trimmed = raw.trim();
+    if (
+      (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+    ) {
+      trimmed = trimmed.slice(1, -1).trim();
+    }
+
+    if (!trimmed || trimmed === 'git') {
+      const candidates: string[] = ['git'];
+      const platform = this.getPlatform();
+      const env = process.env;
+
+      if (platform === 'win32') {
+        if (env.ProgramFiles) {
+          candidates.push(
+            `${env.ProgramFiles}\\Git\\cmd\\git.exe`,
+            `${env.ProgramFiles}\\Git\\bin\\git.exe`
+          );
+        }
+        if (env.ProgramW6432 && env.ProgramW6432 !== env.ProgramFiles) {
+          candidates.push(
+            `${env.ProgramW6432}\\Git\\cmd\\git.exe`,
+            `${env.ProgramW6432}\\Git\\bin\\git.exe`
+          );
+        }
+        if (env['ProgramFiles(x86)']) {
+          candidates.push(
+            `${env['ProgramFiles(x86)']}\\Git\\cmd\\git.exe`,
+            `${env['ProgramFiles(x86)']}\\Git\\bin\\git.exe`
+          );
+        }
+        if (env.LOCALAPPDATA) {
+          candidates.push(
+            `${env.LOCALAPPDATA}\\Programs\\Git\\cmd\\git.exe`,
+            `${env.LOCALAPPDATA}\\Programs\\Git\\bin\\git.exe`
+          );
+        }
+      } else if (platform === 'darwin') {
+        candidates.push('/opt/homebrew/bin/git', '/usr/local/bin/git', '/usr/bin/git');
+      } else if (platform === 'linux') {
+        candidates.push('/usr/bin/git', '/usr/local/bin/git', '/bin/git');
+      }
+
+      // Deduplicate candidates while preserving priority
+      const seen = new Set<string>();
+      const deduped: string[] = [];
+      for (const cand of candidates) {
+        const key = platform === 'win32' ? cand.toLowerCase() : cand;
+        if (!seen.has(key)) {
+          seen.add(key);
+          deduped.push(cand);
+        }
+      }
+      return { isExplicit: false, candidates: deduped };
+    }
+
+    return { isExplicit: true, candidates: [trimmed] };
+  }
+
+  private async testExecutable(file: string): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      try {
+        const execFile = this.getExecFile();
+        execFile(
+          file,
+          ['--version'],
+          { cwd: this.vaultPath || undefined, env: process.env },
+          (error, stdout) => {
+            if (!error && typeof stdout === 'string' && stdout.includes('git version')) {
+              resolve(true);
+            } else {
+              resolve(false);
+            }
+          }
+        );
+      } catch {
+        resolve(false);
+      }
+    });
+  }
+
+  private async resolveGitExecutable(): Promise<string> {
+    if (this.resolvedGitPath) {
+      return this.resolvedGitPath;
+    }
+    if (this.resolvePromise) {
+      return this.resolvePromise;
+    }
+
+    this.resolvePromise = (async () => {
+      const { isExplicit, candidates } = this.getCandidatePaths();
+      for (const candidate of candidates) {
+        const ok = await this.testExecutable(candidate);
+        if (ok) {
+          this.resolvedGitPath = candidate;
+          this.log('Resolved git executable:', candidate);
+          return candidate;
+        }
+      }
+
+      if (isExplicit) {
+        throw new Error(`Configured Git executable not found or failed validation: ${candidates[0]}`);
+      } else {
+        throw new Error(`Git executable not found in PATH or standard locations (${candidates.join(', ')})`);
+      }
+    })();
+
+    try {
+      return await this.resolvePromise;
+    } catch (err) {
+      this.resolvePromise = null;
+      throw err;
+    }
+  }
+
+  private sanitizeOutput(text: string): string {
+    if (!text) return '';
+    let sanitized = text;
+    if (this.token && this.token.length > 0) {
+      sanitized = sanitized.split(this.token).join('***');
+    }
+    sanitized = sanitized.replace(/(https?:\/\/)([^:\/\s@]+):([^@\/\s]+)@/g, '$1$2:***@');
+    sanitized = sanitized.replace(/(https?:\/\/)([^@\/\s:]+)@/g, '$1***@');
+    return sanitized;
+  }
+
+  async exec(args: readonly string[]): Promise<string> {
+    const gitExe = await this.resolveGitExecutable();
+    const execFile = this.getExecFile();
+
     return new Promise((resolve, reject) => {
       // Build environment with token for authentication
       const env = { ...process.env };
@@ -361,16 +512,25 @@ export class GitBackend extends SyncBackend {
         }
       }
 
-      exec(`${this.gitPath} ${args}`, {
-        cwd: this.vaultPath,
-        env,
-      }, (error: Error | null, stdout: string, stderr: string) => {
-        if (error) {
-          reject(new Error(`${error.message}\n${stderr}`));
-        } else {
-          resolve(stdout);
+      execFile(
+        gitExe,
+        args,
+        {
+          cwd: this.vaultPath || undefined,
+          env,
+          maxBuffer: 10 * 1024 * 1024,
+        },
+        (error: Error | null, stdout: string, stderr: string) => {
+          if (error) {
+            const rawMessage = error.message.includes(stderr)
+              ? error.message
+              : `${error.message}\n${stderr}`;
+            reject(new Error(this.sanitizeOutput(rawMessage)));
+          } else {
+            resolve(stdout);
+          }
         }
-      });
+      );
     });
   }
 
