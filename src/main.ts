@@ -409,9 +409,9 @@ export default class HybridGitSyncPlugin extends Plugin {
       }
     }
 
-    // Use sync queue with debouncing
+    // Use sync queue (immediate execution, serialized)
     this.log('Enqueuing sync operation...');
-    this.syncQueue.enqueue(async () => {
+    this.syncQueue.enqueueImmediate(async () => {
       this.log('Sync queue callback executing', {
         hasBackend: !!this.backend,
         backendType: this.backend?.constructor?.name,
