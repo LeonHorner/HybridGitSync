@@ -1800,7 +1800,9 @@ export class ApiBackend extends SyncBackend {
    * Decode base64 to ArrayBuffer (for binary files)
    */
   private decodeBase64Binary(base64: string): ArrayBuffer {
-    const binaryStr = atob(base64);
+    // GitHub's Contents API wraps base64 with newlines — atob rejects
+    // whitespace in some runtimes, so strip it first
+    const binaryStr = atob(base64.replace(/\s/g, ''));
     const bytes = new Uint8Array(binaryStr.length);
     for (let i = 0; i < binaryStr.length; i++) {
       bytes[i] = binaryStr.charCodeAt(i);
@@ -1812,7 +1814,7 @@ export class ApiBackend extends SyncBackend {
    * Decode base64 to UTF-8 string (for text files)
    */
   private decodeBase64Text(base64: string): string {
-    const binaryStr = atob(base64);
+    const binaryStr = atob(base64.replace(/\s/g, ''));
     const bytes = new Uint8Array(binaryStr.length);
     for (let i = 0; i < binaryStr.length; i++) {
       bytes[i] = binaryStr.charCodeAt(i);

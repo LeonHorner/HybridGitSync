@@ -502,6 +502,18 @@ export class GitBackend extends SyncBackend {
     return new Promise((resolve, reject) => {
       // Build environment with token for authentication
       const env = { ...process.env };
+      // Git hooks (git-lfs pre-push, etc.) resolve helpers via PATH. Obsidian
+      // is launched with a minimal PATH that often misses Homebrew locations,
+      // so prepend the git binary's own directory plus common install dirs.
+      const pathSep = this.getPlatform() === 'win32' ? ';' : ':';
+      const extraDirs = ['/usr/local/bin', '/opt/homebrew/bin'];
+      const slash = gitExe.lastIndexOf('/');
+      const backslash = gitExe.lastIndexOf('\\');
+      const lastSep = Math.max(slash, backslash);
+      if (lastSep > 0) {
+        extraDirs.unshift(gitExe.slice(0, lastSep));
+      }
+      env.PATH = extraDirs.join(pathSep) + (env.PATH ? pathSep + env.PATH : '');
       if (this.token) {
         // Use GIT_ASKPASS to provide credentials non-interactively
         // This tells git to use our token when it asks for credentials
