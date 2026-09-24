@@ -2306,8 +2306,10 @@ export class ApiBackend extends SyncBackend {
     if (content instanceof ArrayBuffer) {
       buffer = content;
     } else {
+      // slice() guarantees an exactly-sized ArrayBuffer — TextEncoder's
+      // underlying buffer may be larger than the view
       const encoded = new TextEncoder().encode(content);
-      buffer = encoded.buffer as ArrayBuffer;
+      buffer = encoded.slice().buffer as ArrayBuffer;
     }
 
     const size = buffer.byteLength;
