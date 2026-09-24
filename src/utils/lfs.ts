@@ -33,11 +33,32 @@ const POINTER_VERSION = 'version https://git-lfs.github.com/spec/v1';
 const POINTER_MAX_BYTES = 1024;
 const OID_RE = /^[0-9a-f]{64}$/;
 
-/** Range-chunk size. S3-backed LFS download hrefs honour HTTP Range. */
-const CHUNK_SIZE = 8 * 1024 * 1024;
+/** Below this, one GET is cheaper than several Range handshakes. */
+const SINGLE_GET_MAX = 1024 * 1024;
+/** Aim for this many Range chunks — enough parallelism, few round-trips. */
+const TARGET_CHUNKS = 5;
+/** Floor: smaller chunks only add handshake latency on slow links. */
+const MIN_CHUNK = 1024 * 1024;
+/** Ceiling: keeps retry/resume granularity reasonable on huge objects. */
+const MAX_CHUNK = 16 * 1024 * 1024;
 /** Parallel Range requests per object (file-level downloads are serialized). */
 const CHUNK_CONCURRENCY = 3;
+/** Extra parallelism once an object is split into many chunks (slow links). */
+const CHUNK_CONCURRENCY_LARGE = 4;
 const TRANSFER_ATTEMPTS = 2;
+
+/**
+ * Range-chunk size derived from the object's total size. A pure function of
+ * `size` so retries and resumes agree on the on-disk `.part` layout.
+ *
+ * Mid-size objects get finer chunks (earlier first saved part); very large
+ * objects get bigger chunks to avoid a request storm on high-latency links.
+ */
+export function lfsChunkSizeFor(size: number): number {
+  if (size <= SINGLE_GET_MAX) return size;
+  const raw = Math.ceil(size / TARGET_CHUNKS);
+  return Math.min(MAX_CHUNK, Math.max(MIN_CHUNK, raw));
+}
 
 /** Thrown when the transfer endpoint ignores `Range` — fall back to a single GET. */
 class RangeNotSupportedError extends Error {
@@ -256,8 +277,9 @@ export class GitHubLfsClient {
       throw new Error(`LFS download: no download action for ${oid}`);
     }
 
-    const data = size > CHUNK_SIZE
-      ? await this.downloadChunked(downloadAction, oid, size)
+    const chunkSize = lfsChunkSizeFor(size);
+    const data = chunkSize < size
+      ? await this.downloadChunked(downloadAction, oid, size, chunkSize)
       : await this.transfer('GET', downloadAction, undefined, oid);
 
     if (data.byteLength !== size) {
@@ -274,24 +296,28 @@ export class GitHubLfsClient {
     return data;
   }
 
-  private expectedChunkSize(index: number, size: number): number {
-    const start = index * CHUNK_SIZE;
-    return Math.min(CHUNK_SIZE, size - start);
+  private expectedChunkSize(index: number, size: number, chunkSize: number): number {
+    const start = index * chunkSize;
+    return Math.min(chunkSize, size - start);
   }
 
   /**
    * Parallel Range download. Falls back to a single GET when the endpoint
    * returns 200 for a ranged request (Range unsupported).
    */
-  private async downloadChunked(action: LfsTransferAction, oid: string, size: number): Promise<ArrayBuffer> {
-    const totalChunks = Math.ceil(size / CHUNK_SIZE);
+  private async downloadChunked(action: LfsTransferAction, oid: string, size: number, chunkSize: number): Promise<ArrayBuffer> {
+    const totalChunks = Math.ceil(size / chunkSize);
+    const concurrency = totalChunks > 8 ? CHUNK_CONCURRENCY_LARGE : CHUNK_CONCURRENCY;
+    this.log(
+      `chunked download ${oid.substring(0, 8)}: ${totalChunks} × ${Math.round(chunkSize / 1024)}KB, concurrency ${concurrency}`
+    );
     const chunks = new Array<ArrayBuffer | null>(totalChunks).fill(null);
 
     // Resume: keep any part whose byte length matches the expected chunk
     if (this.store) {
       for (let i = 0; i < totalChunks; i++) {
         const saved = await this.store.readPart(oid, i);
-        if (saved && saved.byteLength === this.expectedChunkSize(i, size)) {
+        if (saved && saved.byteLength === this.expectedChunkSize(i, size, chunkSize)) {
           chunks[i] = saved;
         }
       }
@@ -307,9 +333,9 @@ export class GitHubLfsClient {
     }
 
     try {
-      await mapLimit(missing, CHUNK_CONCURRENCY, async (i) => {
-        const start = i * CHUNK_SIZE;
-        const end = start + this.expectedChunkSize(i, size) - 1;
+      await mapLimit(missing, concurrency, async (i) => {
+        const start = i * chunkSize;
+        const end = start + this.expectedChunkSize(i, size, chunkSize) - 1;
         const part = await this.rangeGet(action, start, end, oid);
         chunks[i] = part;
         if (this.store) {
