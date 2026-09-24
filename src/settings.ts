@@ -132,7 +132,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   apiProvider: 'github',
   apiToken: '',
   apiBaseUrl: '',
-  gitPath: '/usr/local/bin/git',
+  gitPath: 'git',
   autoSync: true,
   autoSyncInterval: 10,
   syncOnStartup: true,

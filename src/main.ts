@@ -978,7 +978,7 @@ export default class HybridGitSyncPlugin extends Plugin {
   private async getTrackedFiles(gitBackend: GitBackend): Promise<string[]> {
     try {
       // Use git ls-files to get list of tracked files
-      const output = await this.execGitCommand(gitBackend, 'ls-files');
+      const output = await this.execGitCommand(gitBackend, ['ls-files']);
       return output.split('\n').filter(file => file.trim() !== '');
     } catch (error) {
       console.error('[HybridGitSync] Failed to get tracked files:', error);
@@ -989,14 +989,14 @@ export default class HybridGitSyncPlugin extends Plugin {
   private async untrackFile(gitBackend: GitBackend, file: string): Promise<void> {
     try {
       // Use git rm --cached to untrack the file
-      await this.execGitCommand(gitBackend, `rm --cached "${file}"`);
+      await this.execGitCommand(gitBackend, ['rm', '--cached', '--', file]);
     } catch (error) {
       console.error(`[HybridGitSync] Failed to untrack file ${file}:`, error);
     }
   }
 
-  private execGitCommand(gitBackend: GitBackend, command: string): Promise<string> {
-    return gitBackend.exec(command);
+  private execGitCommand(gitBackend: GitBackend, args: readonly string[]): Promise<string> {
+    return gitBackend.exec(args);
   }
 
   // ===== Version Restore =====
