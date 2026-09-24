@@ -1,4 +1,4 @@
-import { requestUrl, RequestUrlParam, RequestUrlResponse, Vault } from 'obsidian';
+import { requestUrl, RequestUrlParam, Vault } from 'obsidian';
 import { SyncBackend, SyncResult, SyncStatus, FileChange } from './base';
 import { SyncStateManager } from '../sync/state';
 import { GitignoreRules } from '../utils/gitignore';

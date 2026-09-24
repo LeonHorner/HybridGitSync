@@ -349,8 +349,8 @@ export class GitBackend extends SyncBackend {
     // SAFETY: This method is only called on desktop — callers check Platform.isDesktop first.
     // child_process is listed in esbuild "external" so it is never bundled;
     // require() resolves it from Electron's Node.js runtime.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const cp = require('child_process');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional require() for desktop-only Node.js child_process
+    const cp = require('child_process'); // eslint-disable-line no-restricted-imports -- guarded by Platform.isDesktop callers
     return cp.execFile;
   }
 
@@ -490,8 +490,8 @@ export class GitBackend extends SyncBackend {
     if (this.token && this.token.length > 0) {
       sanitized = sanitized.split(this.token).join('***');
     }
-    sanitized = sanitized.replace(/(https?:\/\/)([^:\/\s@]+):([^@\/\s]+)@/g, '$1$2:***@');
-    sanitized = sanitized.replace(/(https?:\/\/)([^@\/\s:]+)@/g, '$1***@');
+    sanitized = sanitized.replace(/(https?:\/\/)([^:/\s@]+):([^@/\s]+)@/g, '$1$2:***@');
+    sanitized = sanitized.replace(/(https?:\/\/)([^@/\s:]+)@/g, '$1***@');
     return sanitized;
   }
 

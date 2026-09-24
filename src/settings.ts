@@ -144,6 +144,10 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   debug: false,
 };
 
+// NOTE: display() is deprecated since Obsidian 1.13.0 in favor of getSettingDefinitions().
+// We keep display() because minAppVersion is 1.1.0 — the declarative API is unavailable
+// on older Obsidian builds. When minAppVersion is raised to >= 1.13.0, migrate to
+// getSettingDefinitions() and replace this.display() calls with this.update().
 export class SettingsTab extends PluginSettingTab {
   plugin: HybridGitSyncPlugin;
 
