@@ -14,6 +14,7 @@ import type { ConflictDiff } from './sync/conflict';
 import { SyncQueue } from './sync/queue';
 import { NetworkStatus } from './utils/network';
 import { isBinaryFile } from './utils/binary';
+import { sha256Hex } from './utils/lfs';
 import { GitignoreRules } from './utils/gitignore';
 import { Logger, LogLevel } from './utils/logger';
 import { SettingsIO } from './utils/settings-io';
@@ -257,6 +258,8 @@ export default class HybridGitSyncPlugin extends Plugin {
       branch: this.settings.branch,
       baseUrl: this.settings.apiBaseUrl || undefined,
       commitMessage: this.settings.commitMessage,
+      lfsEnabled: this.settings.lfsEnabled,
+      lfsMaxFileSizeMB: this.settings.lfsMaxFileSizeMB,
     }, this.gitignore, this.settings.debug);
   }
 
@@ -585,11 +588,15 @@ export default class HybridGitSyncPlugin extends Plugin {
 
       // Remote changed - check if local also changed
       try {
-        const binary = isBinaryFile(path);
+        const lfs = apiBackend.isLfsPath(path);
+        const binary = lfs || isBinaryFile(path);
         let localContent: string | ArrayBuffer;
         let localHash: string;
 
-        if (binary) {
+        if (lfs) {
+          localContent = await this.app.vault.adapter.readBinary(path);
+          localHash = await sha256Hex(localContent);
+        } else if (binary) {
           localContent = await this.app.vault.adapter.readBinary(path);
           localHash = await apiBackend.gitBlobSha1Binary(localContent);
         } else {
@@ -604,7 +611,7 @@ export default class HybridGitSyncPlugin extends Plugin {
           const remoteFile = await apiBackend.getFile(path);
           if (remoteFile) {
             const isDifferent = binary
-              ? (localContent as ArrayBuffer).byteLength !== (remoteFile.content as ArrayBuffer).byteLength
+              ? (await sha256Hex(localContent)) !== (await sha256Hex(remoteFile.content))
               : localContent !== remoteFile.content;
 
             if (isDifferent) {
@@ -615,6 +622,7 @@ export default class HybridGitSyncPlugin extends Plugin {
                 localModified: new Date(),
                 remoteModified: new Date(),
                 isBinary: binary,
+                lfs,
               });
             }
           }

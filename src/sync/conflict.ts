@@ -4,6 +4,7 @@ import { SyncStateManager } from './state';
 import { Logger } from '../utils/logger';
 import { computeDiff, mergeWithoutMarkers } from '../utils/diff';
 import { isBinaryFile } from '../utils/binary';
+import { sha256Hex } from '../utils/lfs';
 
 export type ConflictResolution = 'local' | 'remote' | 'both' | 'merge' | 'skip';
 // 'merge' = auto-merge with conflict markers and save to file
@@ -31,6 +32,8 @@ export interface ConflictInfo {
   localModified: Date;
   remoteModified: Date;
   isBinary: boolean;
+  /** True when the path is Git LFS-tracked (content identity is sha256) */
+  lfs: boolean;
 }
 
 /**
@@ -110,11 +113,12 @@ export class ConflictResolver {
       if (!remoteFile) continue;
 
       // Compare contents
-      const binary = isBinaryFile(localPath);
+      const lfs = this.backend.isLfsPath(localPath);
+      const binary = lfs || isBinaryFile(localPath);
       let isDifferent: boolean;
       if (binary) {
-        // For binary files, compare by size
-        isDifferent = (localContent as ArrayBuffer).byteLength !== (remoteFile.content as ArrayBuffer).byteLength;
+        // Same-size different-content is a real LFS case — compare by hash
+        isDifferent = (await sha256Hex(localContent)) !== (await sha256Hex(remoteFile.content));
       } else {
         isDifferent = remoteFile.content !== localContent;
       }
@@ -128,6 +132,7 @@ export class ConflictResolver {
           localModified: new Date(), // We don't track local modification time yet
           remoteModified: new Date(),
           isBinary: binary,
+          lfs,
         });
       }
     }
@@ -167,15 +172,11 @@ export class ConflictResolver {
 
             this.logger.info('Pushing local content to remote...');
             try {
-              const newSha = await this.backend.putFile(conflict.path, conflict.localContent, currentSha);
-              this.logger.info('Pushed, new SHA:', newSha);
-              // Update sync state with local content hash
-              const localHash = conflict.isBinary
-                ? await this.gitBlobSha1Binary(conflict.localContent as ArrayBuffer)
-                : await this.gitBlobSha1(conflict.localContent as string);
-              this.stateManager.setFileState(conflict.path, localHash);
-              // Update cached remote SHA
-              this.stateManager.setRemoteSha(conflict.path, newSha);
+              const result = await this.backend.putFile(conflict.path, conflict.localContent, currentSha);
+              this.logger.info('Pushed, new SHA:', result.sha);
+              // files[] = content identity (sha256 for LFS), remoteShas[] = blob sha
+              this.stateManager.setFileState(conflict.path, result.contentHash);
+              this.stateManager.setRemoteSha(conflict.path, result.sha);
               success = true;
             } catch (e) {
               retries--;
@@ -197,9 +198,11 @@ export class ConflictResolver {
             await this.vault.adapter.write(conflict.path, conflict.remoteContent as string);
           }
           // Update sync state with remote content hash
-          const remoteHash = conflict.isBinary
-            ? await this.gitBlobSha1Binary(conflict.remoteContent as ArrayBuffer)
-            : await this.gitBlobSha1(conflict.remoteContent as string);
+          const remoteHash = conflict.lfs
+            ? await sha256Hex(conflict.remoteContent)
+            : conflict.isBinary
+              ? await this.gitBlobSha1Binary(conflict.remoteContent as ArrayBuffer)
+              : await this.gitBlobSha1(conflict.remoteContent as string);
           this.stateManager.setFileState(conflict.path, remoteHash);
           // Remote SHA stays the same (we're using remote's version)
           break;
@@ -218,8 +221,14 @@ export class ConflictResolver {
           if (conflict.isBinary) {
             await this.vault.adapter.writeBinary(localPath, conflict.localContent as ArrayBuffer);
             await this.vault.adapter.writeBinary(remotePath, conflict.remoteContent as ArrayBuffer);
-            this.stateManager.setFileState(localPath, await this.gitBlobSha1Binary(conflict.localContent as ArrayBuffer));
-            this.stateManager.setFileState(remotePath, await this.gitBlobSha1Binary(conflict.remoteContent as ArrayBuffer));
+            const localHash = conflict.lfs
+              ? await sha256Hex(conflict.localContent)
+              : await this.gitBlobSha1Binary(conflict.localContent as ArrayBuffer);
+            const remoteHash = conflict.lfs
+              ? await sha256Hex(conflict.remoteContent)
+              : await this.gitBlobSha1Binary(conflict.remoteContent as ArrayBuffer);
+            this.stateManager.setFileState(localPath, localHash);
+            this.stateManager.setFileState(remotePath, remoteHash);
           } else {
             await this.vault.adapter.write(localPath, conflict.localContent as string);
             await this.vault.adapter.write(remotePath, conflict.remoteContent as string);
@@ -254,13 +263,12 @@ export class ConflictResolver {
           // Push merged content to remote
           const remoteFile = await this.backend.getFile(conflict.path);
           const currentSha = remoteFile?.sha;
-          const newSha = await this.backend.putFile(conflict.path, mergedContent, currentSha);
-          this.logger.info('Pushed to remote, new SHA:', newSha);
+          const result = await this.backend.putFile(conflict.path, mergedContent, currentSha);
+          this.logger.info('Pushed to remote, new SHA:', result.sha);
 
           // Update sync state
-          const mergedHash = await this.gitBlobSha1(mergedContent);
-          this.stateManager.setFileState(conflict.path, mergedHash);
-          this.stateManager.setRemoteSha(conflict.path, newSha);
+          this.stateManager.setFileState(conflict.path, result.contentHash);
+          this.stateManager.setRemoteSha(conflict.path, result.sha);
           this.logger.info('Sync state updated for:', conflict.path);
           break;
         }

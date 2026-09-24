@@ -1,7 +1,15 @@
 import { requestUrl, RequestUrlParam, Vault } from 'obsidian';
 import { SyncBackend, SyncResult, SyncStatus, FileChange } from './base';
 import { SyncStateManager } from '../sync/state';
-import { GitignoreRules } from '../utils/gitignore';
+import { GitignoreRules, ensureGitAttributesUnignored } from '../utils/gitignore';
+import { GitAttributesRules } from '../utils/gitattributes';
+import {
+  GitHubLfsClient,
+  LfsPointer,
+  parseLfsPointer,
+  formatLfsPointer,
+  sha256Hex,
+} from '../utils/lfs';
 import { Logger, LogLevel } from '../utils/logger';
 import { t } from '../i18n';
 import { getErrorMessage, toError } from '../utils/error';
@@ -17,6 +25,8 @@ interface ApiConfig {
   branch: string;     // default branch
   baseUrl?: string;   // custom API endpoint for self-hosted
   commitMessage?: string; // commit message template with {{date}} and {{path}}
+  lfsEnabled?: boolean;        // resolve/transfer LFS objects (GitHub only)
+  lfsMaxFileSizeMB?: number;   // per-file cap for LFS transfer
 }
 
 interface FileEntry {
@@ -120,6 +130,8 @@ export class ApiBackend extends SyncBackend {
   private debug: boolean;
   private logger: Logger;
   private tempFileManager: TempFileManager;
+  private gitAttrs: GitAttributesRules;
+  private lfsClient: GitHubLfsClient | null;
 
   constructor(vault: Vault, config: ApiConfig, gitignore?: GitignoreRules, debug: boolean = false) {
     super();
@@ -147,6 +159,8 @@ export class ApiBackend extends SyncBackend {
     this.debug = debug;
     this.logger = new Logger('ApiBackend', debug ? LogLevel.DEBUG : LogLevel.INFO);
     this.tempFileManager = new TempFileManager(vault, debug);
+    this.gitAttrs = new GitAttributesRules();
+    this.lfsClient = null;
     this.log('ApiBackend created', {
       hasVault: !!vault,
       hasAdapter: !!vault?.adapter,
@@ -158,6 +172,121 @@ export class ApiBackend extends SyncBackend {
   private log(...args: unknown[]): void {
     if (this.debug) {
       this.logger.info(...args);
+    }
+  }
+
+  // ===== Git LFS helpers (GitHub only) =====
+
+  /** True when LFS transfer/resolution is active for this backend. */
+  private get lfsActive(): boolean {
+    return this.config.provider === 'github'
+      && this.config.lfsEnabled !== false
+      && this.gitAttrs.hasLfsPatterns();
+  }
+
+  /** True if `path` matches a filter=lfs rule (regardless of the toggle). */
+  isLfsPath(path: string): boolean {
+    return this.config.provider === 'github' && this.gitAttrs.isLfsTracked(path);
+  }
+
+  private lfsMaxBytes(): number {
+    return (this.config.lfsMaxFileSizeMB ?? 500) * 1024 * 1024;
+  }
+
+  /** LFS Batch API endpoint derived from the API base URL (decision #8). */
+  private lfsEndpoint(): string {
+    let base = this.baseUrl.replace(/\/+$/, '');
+    if (base.startsWith('https://api.')) {
+      base = 'https://' + base.slice('https://api.'.length);
+    } else if (base.startsWith('http://api.')) {
+      base = 'http://' + base.slice('http://api.'.length);
+    }
+    base = base.replace(/\/api\/v3$/, '');
+    return `${base}/${this.config.repo}.git/info/lfs`;
+  }
+
+  private getLfsClient(): GitHubLfsClient {
+    if (!this.lfsClient) {
+      this.lfsClient = new GitHubLfsClient(this.lfsEndpoint(), this.config.token, this.debug);
+    }
+    return this.lfsClient;
+  }
+
+  /**
+   * Load .gitattributes rules (root + nested) from local and/or remote, then
+   * silently un-ignore .gitattributes if LFS patterns are in use. Must run
+   * before shouldIgnore filters that would drop .gitattributes.
+   */
+  private async loadGitAttributes(remoteMap?: Map<string, string>): Promise<void> {
+    if (this.config.provider !== 'github' || this.config.lfsEnabled === false) {
+      return;
+    }
+
+    const candidates = new Set<string>();
+
+    // Local walk: deliberately does NOT filter by shouldIgnore — the default
+    // .* rule is exactly what hides .gitattributes from us.
+    const collectLocal = async (dir: string): Promise<void> => {
+      let listing: { files: string[]; folders: string[] };
+      try {
+        listing = await this.vault.adapter.list(dir);
+      } catch {
+        return;
+      }
+      for (const file of listing.files) {
+        const name = file.split('/').pop();
+        if (name === '.gitattributes') candidates.add(file);
+      }
+      for (const folder of listing.folders) {
+        await collectLocal(folder);
+      }
+    };
+    await collectLocal('');
+
+    if (remoteMap) {
+      for (const path of remoteMap.keys()) {
+        const name = path.split('/').pop();
+        if (name === '.gitattributes') candidates.add(path);
+      }
+    }
+
+    // Shallow rules first so deeper files override (last-match-wins)
+    const ordered = [...candidates].sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+
+    for (const path of ordered) {
+      try {
+        let content: string | null = null;
+        try {
+          content = await this.vault.adapter.read(path);
+        } catch {
+          content = null;
+        }
+        if (content === null) {
+          const remote = await this.getFile(path, { resolveLfs: false });
+          if (remote && typeof remote.content === 'string') {
+            content = remote.content;
+          }
+        }
+        if (content !== null) {
+          const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+          this.gitAttrs.addRules(content, dir);
+          this.log(`Loaded .gitattributes rules from ${path}`);
+        }
+      } catch (e) {
+        this.log(`Failed to load ${path}:`, getErrorMessage(e));
+      }
+    }
+
+    if (this.gitAttrs.hasLfsPatterns()) {
+      try {
+        const wrote = await ensureGitAttributesUnignored(this.vault);
+        if (wrote) {
+          this.gitignore.addRules('!.gitattributes');
+          this.log('Updated .gitignore to allow .gitattributes');
+        }
+      } catch (e) {
+        this.log('Failed to un-ignore .gitattributes:', getErrorMessage(e));
+      }
     }
   }
 
@@ -455,18 +584,29 @@ export class ApiBackend extends SyncBackend {
       await this.tempFileManager.init();
 
       const remoteFiles = await this.listFilesRecursive('');
+      const remoteMap = new Map<string, string>();
+      for (const f of remoteFiles) remoteMap.set(f.path, f.sha);
+      await this.loadGitAttributes(remoteMap);
+
       let pulled = 0;
+      const skippedFiles: Array<{ path: string; size: number; reason: string }> = [];
 
       for (const file of remoteFiles) {
-        const remote = await this.getFile(file.path);
+        // resolveLfs:false first so we can cheaply compare via pointer oid
+        const remote = await this.getFile(file.path, { resolveLfs: false });
         if (!remote) continue;
 
-        const isBinary = isBinaryFile(file.path);
+        const isLfs = !!remote.lfs;
+        const isBinary = isLfs || isBinaryFile(file.path);
 
         // Check if local file exists and differs
         let needUpdate = false;
         try {
-          if (isBinary) {
+          if (isLfs) {
+            const localContent = await this.vault.adapter.readBinary(file.path);
+            const localHash = await sha256Hex(localContent);
+            needUpdate = localHash !== remote.lfs!.oid;
+          } else if (isBinary) {
             const localContent = await this.vault.adapter.readBinary(file.path);
             needUpdate = localContent.byteLength !== (remote.content as ArrayBuffer).byteLength;
           } else {
@@ -480,17 +620,35 @@ export class ApiBackend extends SyncBackend {
           needUpdate = true;
         }
 
-        if (needUpdate) {
-          // Use safe write for atomic file operations
-          await this.tempFileManager.writeSafe(file.path, remote.content);
-          pulled++;
+        if (!needUpdate) continue;
+
+        if (isLfs) {
+          if (this.lfsActive) {
+            const bytes = await this.getLfsClient().download(remote.lfs!.oid, remote.lfs!.size);
+            await this.tempFileManager.writeSafe(file.path, bytes);
+            pulled++;
+          } else {
+            // Decision #1: write the pointer text and report it as skipped
+            await this.tempFileManager.writeSafe(file.path, remote.content);
+            skippedFiles.push({
+              path: file.path,
+              size: remote.lfs!.size,
+              reason: t('file.lfsDisabledReason'),
+            });
+          }
+          continue;
         }
+
+        // Use safe write for atomic file operations
+        await this.tempFileManager.writeSafe(file.path, remote.content);
+        pulled++;
       }
 
       return {
         success: true,
         message: `Pulled ${pulled} file(s) from remote`,
         pulled,
+        skipped: skippedFiles.length > 0 ? skippedFiles : undefined,
       };
     } catch (error) {
       return {
@@ -512,6 +670,7 @@ export class ApiBackend extends SyncBackend {
       for (const f of remoteFiles) {
         remoteMap.set(f.path, f.sha);
       }
+      await this.loadGitAttributes(remoteMap);
 
       // Get local file list
       const localFiles = await this.listLocalFiles('');
@@ -519,13 +678,15 @@ export class ApiBackend extends SyncBackend {
       this.log('Remote files:', remoteMap.size);
       let pushed = 0;
       const errors: string[] = [];
+      const skippedFiles: Array<{ path: string; size: number; reason: string }> = [];
 
       // Upload new/modified files
       for (const localPath of localFiles) {
         if (this.shouldIgnore(localPath)) continue;
 
         try {
-          const isBinary = isBinaryFile(localPath);
+          const lfsTracked = this.isLfsPath(localPath);
+          const isBinary = lfsTracked || isBinaryFile(localPath);
           const remoteSha = remoteMap.get(localPath);
 
           let localContent: string | ArrayBuffer;
@@ -535,14 +696,38 @@ export class ApiBackend extends SyncBackend {
             localContent = await this.vault.adapter.read(localPath);
           }
 
+          // Decision #2: LFS-tracked + real bytes + LFS off → skip (never
+          // raw-push real bytes for an LFS path). A local file that is still
+          // pointer text round-trips as ordinary text.
+          if (lfsTracked && !this.lfsActive) {
+            const localText = typeof localContent === 'string'
+              ? localContent
+              : (localContent.byteLength <= 1024 ? new TextDecoder().decode(localContent) : null);
+            const localPtr = localText ? parseLfsPointer(localText) : null;
+            if (!localPtr) {
+              skippedFiles.push({
+                path: localPath,
+                size: (localContent as ArrayBuffer).byteLength,
+                reason: t('file.lfsDisabledReason'),
+              });
+              remoteMap.delete(localPath);
+              continue;
+            }
+          }
+
           // Check if file needs update by comparing content
           if (remoteSha) {
-            const remoteFile = await this.getFile(localPath);
+            const remoteFile = await this.getFile(localPath, { resolveLfs: false });
             if (remoteFile) {
-              // For binary files, compare by size; for text, compare content
-              const isSame = isBinary
-                ? (remoteFile.content as ArrayBuffer).byteLength === (localContent as ArrayBuffer).byteLength
-                : remoteFile.content === localContent;
+              let isSame: boolean;
+              if (remoteFile.lfs) {
+                const localHash = await sha256Hex(localContent);
+                isSame = localHash === remoteFile.lfs.oid;
+              } else if (isBinary) {
+                isSame = (remoteFile.content as ArrayBuffer).byteLength === (localContent as ArrayBuffer).byteLength;
+              } else {
+                isSame = remoteFile.content === localContent;
+              }
               if (isSame) {
                 remoteMap.delete(localPath); // Mark as processed
                 continue; // No change
@@ -551,9 +736,9 @@ export class ApiBackend extends SyncBackend {
           }
 
           this.log('Uploading:', localPath);
-          const newSha = await this.putFile(localPath, localContent, remoteSha);
-          this.stateManager.setFileState(localPath, newSha);
-          this.stateManager.setRemoteSha(localPath, newSha);
+          const result = await this.putFile(localPath, localContent, remoteSha);
+          this.stateManager.setFileState(localPath, result.contentHash);
+          this.stateManager.setRemoteSha(localPath, result.sha);
           pushed++;
           remoteMap.delete(localPath); // Mark as processed
         } catch (e) {
@@ -584,6 +769,7 @@ export class ApiBackend extends SyncBackend {
           success: pushed > 0,
           message: `Pushed ${pushed} file(s), ${errors.length} error(s)`,
           pushed,
+          skipped: skippedFiles.length > 0 ? skippedFiles : undefined,
           error: new Error(errors.join('\n')),
         };
       }
@@ -592,6 +778,7 @@ export class ApiBackend extends SyncBackend {
         success: true,
         message: `Pushed ${pushed} file(s) to remote`,
         pushed,
+        skipped: skippedFiles.length > 0 ? skippedFiles : undefined,
       };
     } catch (error) {
       return {
@@ -636,6 +823,10 @@ export class ApiBackend extends SyncBackend {
           error: toError(error),
         };
       }
+
+      // Load .gitattributes before any shouldIgnore filtering (LFS patterns
+      // also un-ignore .gitattributes itself in the default gitignore)
+      await this.loadGitAttributes(remoteMap);
 
       // ===== Remote reset protection =====
       // An empty or rewritten remote combined with a non-empty local cache
@@ -790,7 +981,11 @@ export class ApiBackend extends SyncBackend {
       const localMap = new Map<string, string>(); // path -> content hash
       for (const path of localFiles) {
         try {
-          if (isBinaryFile(path)) {
+          if (this.isLfsPath(path)) {
+            // LFS content identity is the sha256 of the real bytes
+            const content = await this.vault.adapter.readBinary(path);
+            localMap.set(path, await sha256Hex(content));
+          } else if (isBinaryFile(path)) {
             const content = await this.vault.adapter.readBinary(path);
             localMap.set(path, await this.gitBlobSha1Binary(content));
           } else {
@@ -892,15 +1087,26 @@ export class ApiBackend extends SyncBackend {
       for (const path of actions.needsContentComparison) {
         if (this.shouldIgnore(path)) continue;
         try {
-          const isBinary = isBinaryFile(path);
-          const remoteFile = await this.getFile(path);
+          const isLfs = this.isLfsPath(path);
+          const isBinary = isLfs || isBinaryFile(path);
+          // resolveLfs:false — comparison only needs the pointer oid, never
+          // the object itself
+          const remoteFile = await this.getFile(path, { resolveLfs: false });
           if (!remoteFile) continue;
 
           let localContent: string | ArrayBuffer;
           let localHash: string;
           let remoteHash: string;
 
-          if (isBinary) {
+          if (isLfs) {
+            localContent = await this.vault.adapter.readBinary(path);
+            localHash = await sha256Hex(localContent);
+            // remoteFile.lfs is the pointer meta; fall back to hashing the
+            // raw content for unconverted files that merely match the pattern
+            remoteHash = remoteFile.lfs
+              ? remoteFile.lfs.oid
+              : await sha256Hex(remoteFile.content as ArrayBuffer);
+          } else if (isBinary) {
             localContent = await this.vault.adapter.readBinary(path);
             localHash = await this.gitBlobSha1Binary(localContent);
             remoteHash = await this.gitBlobSha1Binary(remoteFile.content as ArrayBuffer);
@@ -912,8 +1118,11 @@ export class ApiBackend extends SyncBackend {
 
           // Compare by hash (works for both text and binary)
           if (localHash === remoteHash) {
-            // Same content - no action needed, just update state
+            // Same content - no action needed, just update state.
+            // For LFS the two state maps diverge: files[] holds the content
+            // identity (sha256), remoteShas[] holds the pointer blob SHA.
             this.stateManager.setFileState(path, localHash);
+            this.stateManager.setRemoteSha(path, remoteFile.sha);
             this.log('Same content on both sides:', path);
           } else {
             // Different content - check who changed
@@ -966,29 +1175,58 @@ export class ApiBackend extends SyncBackend {
 
       this.log('Files to pull:', smallFiles.length);
 
-      // Download small files in parallel (max 3)
+      // Download files in parallel (max 3)
       const pullPromises = smallFiles
         .map(async (path) => {
           try {
-            const remoteFile = await this.getFile(path);
+            // resolveLfs:false first — decide cheaply whether the object is
+            // needed, and never download it just to compare
+            const remoteFile = await this.getFile(path, { resolveLfs: false });
             if (!remoteFile) return;
 
-            const isBinary = isBinaryFile(path);
-            const contentSize = isBinary
-              ? (remoteFile.content as ArrayBuffer).byteLength
-              : (remoteFile.content as string).length;
+            const isLfs = !!remoteFile.lfs;
+            const isBinary = isLfs || isBinaryFile(path);
+            let contentToWrite: string | ArrayBuffer;
+            let contentHash: string;
 
-            this.log(`Processing ${path}: ${contentSize} bytes, binary: ${isBinary}`);
+            if (isLfs) {
+              const ptr = remoteFile.lfs!;
+              if (this.lfsActive) {
+                contentToWrite = await this.getLfsClient().download(ptr.oid, ptr.size);
+                contentHash = ptr.oid;
+              } else {
+                // Decision #1: leave the pointer text, report as skipped
+                contentToWrite = remoteFile.content;
+                contentHash = await this.gitBlobSha1(remoteFile.content as string);
+                skippedFiles.push({
+                  path,
+                  size: ptr.size,
+                  reason: t('file.lfsDisabledReason'),
+                });
+              }
+            } else if (isBinary) {
+              // May still need the large-file download_url path
+              const full = remoteFile.content instanceof ArrayBuffer
+                ? remoteFile
+                : await this.getFile(path);
+              if (!full) return;
+              contentToWrite = full.content;
+              contentHash = await this.gitBlobSha1Binary(full.content as ArrayBuffer);
+            } else {
+              contentToWrite = remoteFile.content;
+              contentHash = await this.gitBlobSha1(remoteFile.content as string);
+            }
+
+            const contentSize = contentToWrite instanceof ArrayBuffer
+              ? contentToWrite.byteLength
+              : contentToWrite.length;
+            this.log(`Processing ${path}: ${contentSize} bytes, binary: ${isBinary}, lfs: ${isLfs}`);
 
             // Use safe write for atomic file operations
-            await this.tempFileManager.writeSafe(path, remoteFile.content);
+            await this.tempFileManager.writeSafe(path, contentToWrite);
 
-            // Store content hash (SHA-1)
-            const contentHash = isBinary
-              ? await this.gitBlobSha1Binary(remoteFile.content as ArrayBuffer)
-              : await this.gitBlobSha1(remoteFile.content as string);
             this.stateManager.setFileState(path, contentHash);
-            // Update cached remote SHA
+            // Update cached remote SHA (pointer blob SHA for LFS)
             const remoteSha = remoteMap.get(path);
             if (remoteSha) {
               this.stateManager.setRemoteSha(path, remoteSha);
@@ -1032,6 +1270,25 @@ export class ApiBackend extends SyncBackend {
 
           for (const path of filesToPush) {
             try {
+              // LFS files are exempt from the 100MB blob limit (issue #11) —
+              // the committed payload is the ~130-byte pointer. They are
+              // capped by lfsMaxFileSizeMB instead.
+              if (this.isLfsPath(path)) {
+                const bytes = await this.vault.adapter.readBinary(path);
+                if (bytes.byteLength > this.lfsMaxBytes()) {
+                  skippedFiles.push({
+                    path,
+                    size: bytes.byteLength,
+                    reason: t('file.skippedLfsTooLargeReason', {
+                      max: String(this.config.lfsMaxFileSizeMB ?? 500),
+                    }),
+                  });
+                } else {
+                  filesWithSize.push({ path, size: 130 });
+                }
+                continue;
+              }
+
               const isBinary = isBinaryFile(path);
               let size: number;
 
@@ -1157,9 +1414,57 @@ export class ApiBackend extends SyncBackend {
               this.log(`Processing batch ${batchIndex + 1}/${batches.length} (${batch.length} files)`);
 
               // Read file contents
-              const filesWithContent: { path: string; content: string | ArrayBuffer; isBinary: boolean; contentHash: string }[] = [];
+              const filesWithContent: {
+                path: string;
+                content: string | ArrayBuffer;
+                isBinary: boolean;
+                contentHash: string;
+                remoteSha: string;
+              }[] = [];
+              const pendingLfs: Array<{ oid: string; size: number; data: ArrayBuffer; path: string }> = [];
+
               for (const file of batch) {
                 try {
+                  if (this.isLfsPath(file.path)) {
+                    const bytes = await this.vault.adapter.readBinary(file.path);
+                    const asText = bytes.byteLength <= 1024 ? new TextDecoder().decode(bytes) : null;
+                    const existingPtr = asText ? parseLfsPointer(asText) : null;
+
+                    if (existingPtr) {
+                      // Decision #9: already a pointer — commit as-is
+                      const pointerText = asText as string;
+                      filesWithContent.push({
+                        path: file.path,
+                        content: pointerText,
+                        isBinary: false,
+                        contentHash: await this.gitBlobSha1(pointerText),
+                        remoteSha: await this.gitBlobSha1(pointerText),
+                      });
+                      continue;
+                    }
+
+                    if (!this.lfsActive) {
+                      skippedFiles.push({
+                        path: file.path,
+                        size: bytes.byteLength,
+                        reason: t('file.lfsDisabledReason'),
+                      });
+                      continue;
+                    }
+
+                    const oid = await sha256Hex(bytes);
+                    const pointerText = formatLfsPointer(oid, bytes.byteLength);
+                    filesWithContent.push({
+                      path: file.path,
+                      content: pointerText,
+                      isBinary: false,
+                      contentHash: oid,
+                      remoteSha: await this.gitBlobSha1(pointerText),
+                    });
+                    pendingLfs.push({ oid, size: bytes.byteLength, data: bytes, path: file.path });
+                    continue;
+                  }
+
                   const isBinary = isBinaryFile(file.path);
                   let content: string | ArrayBuffer;
 
@@ -1173,7 +1478,13 @@ export class ApiBackend extends SyncBackend {
                     ? await this.gitBlobSha1Binary(content as ArrayBuffer)
                     : await this.gitBlobSha1(content as string);
 
-                  filesWithContent.push({ path: file.path, content, isBinary, contentHash });
+                  filesWithContent.push({
+                    path: file.path,
+                    content,
+                    isBinary,
+                    contentHash,
+                    remoteSha: contentHash,
+                  });
                 } catch (e) {
                   errors.push(`read ${file.path}: ${getErrorMessage(e)}`);
                 }
@@ -1181,21 +1492,35 @@ export class ApiBackend extends SyncBackend {
 
               if (filesWithContent.length === 0) continue;
 
+              // LFS objects first (decision #10): a failed upload must never
+              // leave a dangling pointer committed
+              const lfsFailed = new Set<string>();
+              for (const obj of pendingLfs) {
+                try {
+                  await this.getLfsClient().upload(obj.oid, obj.size, obj.data);
+                } catch (e) {
+                  lfsFailed.add(obj.path);
+                  errors.push(`lfs upload ${obj.path}: ${getErrorMessage(e)}`);
+                }
+              }
+              const commitItems = filesWithContent.filter(f => !lfsFailed.has(f.path));
+              if (commitItems.length === 0) continue;
+
               const commitMessage = this.buildCommitMessage();
 
               const result = await this.batchCommitWithGitDataApi(
-                filesWithContent.map(f => ({ path: f.path, content: f.content, isBinary: f.isBinary })),
+                commitItems.map(f => ({ path: f.path, content: f.content, isBinary: f.isBinary })),
                 commitMessage
               );
 
               if (result.success) {
-                for (const file of filesWithContent) {
+                for (const file of commitItems) {
                   this.stateManager.setFileState(file.path, file.contentHash);
-                  this.stateManager.setRemoteSha(file.path, file.contentHash);
+                  this.stateManager.setRemoteSha(file.path, file.remoteSha);
                   pushedThisSync.add(file.path);
                   pushed++;
                 }
-                this.log(`Batch ${batchIndex + 1} complete (Git Data API): ${filesWithContent.length} files pushed`);
+                this.log(`Batch ${batchIndex + 1} complete (Git Data API): ${commitItems.length} files pushed`);
               } else {
                 errors.push(`batch ${batchIndex + 1}: ${result.error}`);
               }
@@ -1335,15 +1660,17 @@ export class ApiBackend extends SyncBackend {
 
       // Step 13: Cache remote SHAs for next sync
       // remoteMap is a pre-sync snapshot, so override files pushed during
-      // this sync with their new blob SHAs (equal to the content hash) and
-      // drop files deleted during this sync - otherwise the next sync would
-      // see a stale "remote changed" and could report false conflicts
+      // this sync with their new blob SHAs and drop files deleted during
+      // this sync - otherwise the next sync would see a stale "remote
+      // changed" and could report false conflicts.
+      // Use getRemoteSha (not getFileState): for LFS paths files[] holds the
+      // content identity (sha256) while remoteShas[] holds the pointer blob SHA.
       const remoteShas: Record<string, string> = {};
       for (const [path, sha] of remoteMap) {
         remoteShas[path] = sha;
       }
       for (const path of pushedThisSync) {
-        const sha = this.stateManager.getFileState(path);
+        const sha = this.stateManager.getRemoteSha(path);
         if (sha) remoteShas[path] = sha;
       }
       for (const path of deletedThisSync) {
@@ -1403,11 +1730,15 @@ export class ApiBackend extends SyncBackend {
         if (!remoteSha) {
           changedFiles.push({ path: localPath, status: 'added' });
         } else {
-          const isBinary = isBinaryFile(localPath);
-          const remoteFile = await this.getFile(localPath);
+          const isLfs = this.isLfsPath(localPath);
+          const isBinary = isLfs || isBinaryFile(localPath);
+          const remoteFile = await this.getFile(localPath, { resolveLfs: false });
           if (remoteFile) {
             let isSame: boolean;
-            if (isBinary) {
+            if (remoteFile.lfs) {
+              const localContent = await this.vault.adapter.readBinary(localPath);
+              isSame = (await sha256Hex(localContent)) === remoteFile.lfs.oid;
+            } else if (isBinary) {
               const localContent = await this.vault.adapter.readBinary(localPath);
               isSame = (remoteFile.content as ArrayBuffer).byteLength === localContent.byteLength;
             } else {
@@ -1513,7 +1844,10 @@ export class ApiBackend extends SyncBackend {
     return btoa(binaryStr);
   }
 
-  async getFile(path: string): Promise<{ content: string | ArrayBuffer; sha: string } | null> {
+  async getFile(
+    path: string,
+    opts?: { resolveLfs?: boolean }
+  ): Promise<{ content: string | ArrayBuffer; sha: string; lfs?: LfsPointer } | null> {
     try {
       if (this.config.provider === 'gitlab') {
         return await this.getGitlabFile(path);
@@ -1600,6 +1934,28 @@ export class ApiBackend extends SyncBackend {
         }
       } else {
         content = data.content;
+      }
+
+      // Git LFS pointer detection (GitHub only). A pointer is ~130 bytes, so
+      // the Contents API returns it inline even for "binary" extensions —
+      // without this check the pointer text would be written into the vault.
+      if (this.config.provider === 'github') {
+        let candidateText: string | null = null;
+        if (typeof content === 'string') {
+          candidateText = content;
+        } else if (content.byteLength <= 1024) {
+          candidateText = new TextDecoder().decode(content);
+        }
+        const ptr = candidateText ? parseLfsPointer(candidateText) : null;
+        if (ptr) {
+          if (opts?.resolveLfs === false || !this.lfsActive) {
+            // Caller wants the pointer itself, or LFS is disabled: return the
+            // pointer text (decision #1) so the caller can report/skip it.
+            return { content: candidateText as string, sha: data.sha, lfs: ptr };
+          }
+          const bytes = await this.getLfsClient().download(ptr.oid, ptr.size);
+          return { content: bytes, sha: data.sha, lfs: ptr };
+        }
       }
 
       return { content, sha: data.sha };
@@ -1838,15 +2194,23 @@ export class ApiBackend extends SyncBackend {
     }
   }
 
-  async putFile(path: string, content: string | ArrayBuffer, sha?: string): Promise<string> {
-    const isBinary = content instanceof ArrayBuffer;
+  /**
+   * Upload a single file. Returns both the git blob SHA (for remoteShas) and
+   * the content identity hash (for files[]) — they diverge for LFS paths
+   * (pointer blob SHA vs sha256 of the real bytes) and are equal otherwise.
+   */
+  async putFile(
+    path: string,
+    content: string | ArrayBuffer,
+    sha?: string
+  ): Promise<{ sha: string; contentHash: string }> {
+    // Git LFS: real bytes go to the LFS object store, the pointer is committed
+    if (this.isLfsPath(path)) {
+      return await this.putLfsFile(path, content, sha);
+    }
 
-    // Build commit message from template
-    const now = new Date();
-    const dateStr = now.toISOString().replace('T', ' ').substring(0, 19);
-    const commitMessage = (this.config.commitMessage || 'sync: {{path}}')
-      .replace('{{date}}', dateStr)
-      .replace('{{path}}', path);
+    const isBinary = content instanceof ArrayBuffer;
+    const commitMessage = this.buildCommitMessage().replace('{{path}}', path);
 
     if (this.config.provider === 'gitlab') {
       // GitLab: Commits API with a single action (no CAS needed)
@@ -1867,9 +2231,10 @@ export class ApiBackend extends SyncBackend {
       );
       // GitLab doesn't return the new blob SHA - compute it locally so it stays
       // consistent with Tree API blob ids used for change detection
-      return isBinary
+      const contentHash = isBinary
         ? await this.gitBlobSha1Binary(content)
         : await this.gitBlobSha1(content);
+      return { sha: contentHash, contentHash };
     }
 
     const base64Content = isBinary
@@ -1892,13 +2257,124 @@ export class ApiBackend extends SyncBackend {
         const data = await this.apiRequest<PutFileResponse>(method,
           `/repos/${this.config.repo}/contents/${path}`, body
         );
-        return data.content.sha;
+        const contentHash = isBinary
+          ? await this.gitBlobSha1Binary(content)
+          : await this.gitBlobSha1(content as string);
+        return { sha: data.content.sha, contentHash };
       } catch (error) {
         const msg = getErrorMessage(error);
         if (msg.includes('409') && attempt < maxRetries - 1) {
           // Wait before retry (exponential backoff: 1s, 2s, 4s)
           const delay = Math.pow(2, attempt) * 1000;
           this.log(`Conflict uploading ${path}, retrying in ${delay}ms...`);
+          await new Promise(resolve => window.setTimeout(resolve, delay));
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error(`Failed to upload ${path} after ${maxRetries} attempts`);
+  }
+
+  /**
+   * LFS upload: object first, pointer second (decision #10 — never commit a
+   * pointer without its object). If the content is already a pointer it is
+   * committed as-is (decision #9) so pointer text never becomes a new object.
+   */
+  private async putLfsFile(
+    path: string,
+    content: string | ArrayBuffer,
+    sha?: string
+  ): Promise<{ sha: string; contentHash: string }> {
+    // Decision #9: content already looks like a pointer → commit it as text
+    const asText = content instanceof ArrayBuffer
+      ? (content.byteLength <= 1024 ? new TextDecoder().decode(content) : null)
+      : content;
+    const existingPtr = asText ? parseLfsPointer(asText) : null;
+    if (existingPtr) {
+      const pointerText = asText as string;
+      const result = await this.putTextFile(path, pointerText, sha);
+      const contentHash = await this.gitBlobSha1(pointerText);
+      return { sha: result.sha, contentHash };
+    }
+
+    if (!this.lfsActive) {
+      throw new Error(t('file.lfsDisabledReason'));
+    }
+
+    let buffer: ArrayBuffer;
+    if (content instanceof ArrayBuffer) {
+      buffer = content;
+    } else {
+      const encoded = new TextEncoder().encode(content);
+      buffer = encoded.buffer as ArrayBuffer;
+    }
+
+    const size = buffer.byteLength;
+    if (size > this.lfsMaxBytes()) {
+      throw new Error(t('file.skippedLfsTooLargeReason', {
+        max: String(this.config.lfsMaxFileSizeMB ?? 500),
+      }));
+    }
+
+    const oid = await sha256Hex(buffer);
+    const pointerText = formatLfsPointer(oid, size);
+
+    // Object first — if this throws, no pointer is committed
+    await this.getLfsClient().upload(oid, size, buffer);
+
+    const result = await this.putTextFile(path, pointerText, sha);
+    return { sha: result.sha, contentHash: oid };
+  }
+
+  /** Commit a small text blob via the provider's single-file write path. */
+  private async putTextFile(
+    path: string,
+    text: string,
+    sha?: string
+  ): Promise<{ sha: string }> {
+    const now = new Date();
+    const dateStr = now.toISOString().replace('T', ' ').substring(0, 19);
+    const commitMessage = (this.config.commitMessage || 'sync: {{path}}')
+      .replace('{{date}}', dateStr)
+      .replace('{{path}}', path);
+
+    if (this.config.provider === 'gitlab') {
+      await this.apiRequest('POST',
+        `/projects/${this.gitlabProjectId()}/repository/commits`,
+        {
+          branch: this.config.branch,
+          commit_message: commitMessage,
+          actions: [{
+            action: sha ? 'update' : 'create',
+            file_path: path,
+            content: text,
+            encoding: 'text',
+          }],
+        }
+      );
+      return { sha: await this.gitBlobSha1(text) };
+    }
+
+    const body: Record<string, string> = {
+      message: commitMessage,
+      content: this.encodeBase64Text(text),
+      branch: this.config.branch,
+    };
+    if (sha) body.sha = sha;
+
+    const maxRetries = 3;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const method = !sha ? 'POST' : 'PUT';
+        const data = await this.apiRequest<PutFileResponse>(method,
+          `/repos/${this.config.repo}/contents/${path}`, body
+        );
+        return { sha: data.content.sha };
+      } catch (error) {
+        const msg = getErrorMessage(error);
+        if (msg.includes('409') && attempt < maxRetries - 1) {
+          const delay = Math.pow(2, attempt) * 1000;
           await new Promise(resolve => window.setTimeout(resolve, delay));
           continue;
         }

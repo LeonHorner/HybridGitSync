@@ -65,7 +65,12 @@ export class ConflictModal extends Modal {
     const buttonEl = contentEl.createDiv('conflict-buttons');
     this.createActionButton(buttonEl, t('ui.keepLocal'), 'local', 'btn-local');
     this.createActionButton(buttonEl, t('ui.keepRemote'), 'remote', 'btn-remote');
-    this.createActionButton(buttonEl, t('ui.keepAll'), 'merge', 'btn-merge');
+    if (this.conflict.isBinary) {
+      // Binary/LFS files cannot be auto-merged — offer keep-both instead
+      this.createActionButton(buttonEl, t('ui.keepBoth'), 'both', 'btn-both');
+    } else {
+      this.createActionButton(buttonEl, t('ui.keepAll'), 'merge', 'btn-merge');
+    }
     this.createActionButton(buttonEl, t('ui.skip'), 'skip', 'btn-skip');
   }
 
