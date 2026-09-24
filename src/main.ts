@@ -756,6 +756,9 @@ export default class HybridGitSyncPlugin extends Plugin {
       this.app.vault.offref(ref);
     }
     this.fileChangeRefs = [];
+    // Drop any debounced file-change sync that is still pending — otherwise
+    // it fires after the option is turned off
+    this.syncQueue?.clear();
   }
 
   private onFileChange(): void {
