@@ -1,3 +1,4 @@
+import { Vault } from 'obsidian';
 import { t } from '../i18n';
 
 /**
@@ -57,6 +58,7 @@ export class GitignoreRules {
 # ${t('gitignore.keepDotfiles')}
 !${dir}/
 !.gitignore
+!.gitattributes
 
 # ${t('gitignore.obsidianDeviceFiles')}
 ${dir}/workspace.json
@@ -210,4 +212,38 @@ interface GitignorePattern {
   pattern: string;
   regex: RegExp;
   negate: boolean;
+}
+
+const GITATTRIBUTES_UNIGNORE_RE = /^[ \t]*![ \t]*\/?\.gitattributes[ \t]*$/m;
+
+/**
+ * Append `!.gitattributes` to .gitignore if missing (the default `.*` rule
+ * would otherwise ignore it, breaking LFS pattern matching). Silent and
+ * idempotent — never rewrites existing lines. Returns true if written.
+ */
+export async function ensureGitAttributesUnignored(vault: Vault): Promise<boolean> {
+  let content: string | null = null;
+  try {
+    content = await vault.adapter.read('.gitignore');
+  } catch {
+    content = null;
+  }
+
+  if (content === null) {
+    // No .gitignore yet — create one from the default template (which already
+    // includes !.gitattributes)
+    const dir = vault.configDir;
+    const fallback = new GitignoreRules(dir).getDefaultContent();
+    await vault.adapter.write('.gitignore', fallback);
+    return true;
+  }
+
+  const normalized = content.replace(/\r\n/g, '\n');
+  if (GITATTRIBUTES_UNIGNORE_RE.test(normalized)) {
+    return false;
+  }
+
+  const prefix = normalized.endsWith('\n') || normalized.length === 0 ? '' : '\n';
+  await vault.adapter.write('.gitignore', `${normalized}${prefix}!.gitattributes\n`);
+  return true;
 }

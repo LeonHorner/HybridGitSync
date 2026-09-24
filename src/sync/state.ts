@@ -223,13 +223,19 @@ export class SyncStateManager {
           actions.needsContentComparison.push(path);
         }
       } else {
-        // File existed at last sync
+        // File existed at last sync.
+        // localChanged compares against files[] (content identity).
+        // remoteChanged compares against remoteShas[] (tree blob sha) — for
+        // plain files the two maps hold equal values, but LFS pointer files
+        // diverge (files[] = sha256 of real bytes, remoteShas[] = pointer blob).
         const lastSha = lastKnown.get(path)!;
+        const lastRemoteSha = this.state.remoteShas[path] ?? lastSha;
         const localChanged = existsLocal && currentLocal.get(path) !== lastSha;
-        const remoteChanged = existsRemote && currentRemote.get(path) !== lastSha;
+        const remoteChanged = existsRemote && currentRemote.get(path) !== lastRemoteSha;
 
         this.log(`${path}:`, {
           lastSha: lastSha?.substring(0, 8),
+          lastRemoteSha: lastRemoteSha?.substring(0, 8),
           localHash: currentLocal.get(path)?.substring(0, 8),
           remoteSha: currentRemote.get(path)?.substring(0, 8),
           localChanged,

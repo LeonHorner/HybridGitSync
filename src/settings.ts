@@ -121,6 +121,10 @@ export interface PluginSettings {
   pullStrategy: 'merge' | 'rebase';
   showNotice: boolean;         // show notification on sync
 
+  // Git LFS (GitHub API backend)
+  lfsEnabled: boolean;         // resolve/transfer LFS objects
+  lfsMaxFileSizeMB: number;    // per-file cap for LFS transfer
+
   // Advanced
   debug: boolean;
 }
@@ -141,6 +145,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   commitMessage: 'vault backup: {{date}}',
   pullStrategy: 'merge',
   showNotice: true,
+  lfsEnabled: true,
+  lfsMaxFileSizeMB: 500,
   debug: false,
 };
 
@@ -176,6 +182,7 @@ export class SettingsTab extends PluginSettingTab {
     this.renderRemoteSettings(containerEl);
     this.renderAutoSyncSettings(containerEl);
     this.renderBehaviorSettings(containerEl);
+    this.renderLfsSettings(containerEl);
     this.renderGitignoreSettings(containerEl);
     this.renderAdvancedSettings(containerEl);
   }
@@ -456,6 +463,33 @@ export class SettingsTab extends PluginSettingTab {
         .setValue(this.plugin.settings.showNotice)
         .onChange(async (value) => {
           this.plugin.settings.showNotice = value;
+          await this.plugin.saveSettings();
+        }));
+  }
+
+  private renderLfsSettings(el: HTMLElement): void {
+    new Setting(el).setName(t('settings.lfs')).setHeading();
+
+    new Setting(el)
+      .setName(t('settings.lfsEnabled'))
+      .setDesc(t('settings.lfsEnabledDesc'))
+      .addToggle(cb => cb
+        .setValue(this.plugin.settings.lfsEnabled)
+        .onChange(async (value) => {
+          this.plugin.settings.lfsEnabled = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(el)
+      .setName(t('settings.lfsMaxSize'))
+      .setDesc(t('settings.lfsMaxSizeDesc'))
+      .addText(cb => cb
+        .setPlaceholder('500')
+        .setValue(String(this.plugin.settings.lfsMaxFileSizeMB))
+        .onChange(async (value) => {
+          const parsed = parseInt(value, 10);
+          const clamped = Number.isFinite(parsed) ? Math.min(4096, Math.max(1, parsed)) : 500;
+          this.plugin.settings.lfsMaxFileSizeMB = clamped;
           await this.plugin.saveSettings();
         }));
   }
