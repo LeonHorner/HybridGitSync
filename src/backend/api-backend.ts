@@ -207,7 +207,17 @@ export class ApiBackend extends SyncBackend {
 
   private getLfsClient(): GitHubLfsClient {
     if (!this.lfsClient) {
-      this.lfsClient = new GitHubLfsClient(this.lfsEndpoint(), this.config.token, this.debug);
+      // Part store lets interrupted downloads resume from saved Range chunks
+      this.lfsClient = new GitHubLfsClient(
+        this.lfsEndpoint(),
+        this.config.token,
+        this.debug,
+        {
+          readPart: (oid, index) => this.tempFileManager.readLfsPart(oid, index),
+          writePart: (oid, index, data) => this.tempFileManager.writeLfsPart(oid, index, data),
+          clearParts: (oid) => this.tempFileManager.clearLfsParts(oid),
+        }
+      );
     }
     return this.lfsClient;
   }

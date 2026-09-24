@@ -110,6 +110,46 @@ export class TempFileManager {
     }
   }
 
+  // ===== LFS chunk parts (resumable downloads) =====
+  // Named `.part` on purpose: cleanup() only sweeps `*.tmp`, so a partial
+  // download survives across syncs and app restarts.
+
+  private lfsPartPath(oid: string, index: number): string {
+    return `${this.tempDir}/lfs-${oid}-${index}.part`;
+  }
+
+  async readLfsPart(oid: string, index: number): Promise<ArrayBuffer | null> {
+    try {
+      return await this.vault.adapter.readBinary(this.lfsPartPath(oid, index));
+    } catch {
+      return null;
+    }
+  }
+
+  async writeLfsPart(oid: string, index: number, data: ArrayBuffer): Promise<void> {
+    try {
+      await this.vault.adapter.mkdir(this.tempDir);
+    } catch {
+      // Directory may already exist
+    }
+    await this.vault.adapter.writeBinary(this.lfsPartPath(oid, index), data);
+  }
+
+  async clearLfsParts(oid: string): Promise<void> {
+    try {
+      const listing = await this.vault.adapter.list(this.tempDir);
+      const prefix = `lfs-${oid}-`;
+      for (const file of listing.files) {
+        const name = file.split('/').pop() ?? '';
+        if (name.startsWith(prefix) && name.endsWith('.part')) {
+          await this.vault.adapter.remove(file);
+        }
+      }
+    } catch {
+      // Temp directory may not exist
+    }
+  }
+
   /**
    * Remove a specific temp file
    */
