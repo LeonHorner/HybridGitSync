@@ -33,6 +33,48 @@ const POINTER_VERSION = 'version https://git-lfs.github.com/spec/v1';
 const POINTER_MAX_BYTES = 1024;
 const OID_RE = /^[0-9a-f]{64}$/;
 
+/** Range-chunk size. S3-backed LFS download hrefs honour HTTP Range. */
+const CHUNK_SIZE = 8 * 1024 * 1024;
+/** Parallel Range requests per object (file-level downloads are serialized). */
+const CHUNK_CONCURRENCY = 3;
+const TRANSFER_ATTEMPTS = 2;
+
+/** Thrown when the transfer endpoint ignores `Range` — fall back to a single GET. */
+class RangeNotSupportedError extends Error {
+  constructor() {
+    super('LFS transfer endpoint does not support HTTP Range');
+    this.name = 'RangeNotSupportedError';
+  }
+}
+
+/** Map with at most `limit` concurrent invocations. */
+async function mapLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * Optional persistent store for partially-downloaded LFS chunks. When present,
+ * a failed download resumes from the saved parts on the next attempt.
+ */
+export interface LfsPartStore {
+  readPart(oid: string, index: number): Promise<ArrayBuffer | null>;
+  writePart(oid: string, index: number, data: ArrayBuffer): Promise<void>;
+  clearParts(oid: string): Promise<void>;
+}
+
 /**
  * Strict LFS pointer parser: exactly 3 lines, whole text <= 1024 bytes.
  * Returns null for anything that is not a v1 pointer.
@@ -97,13 +139,17 @@ export class GitHubLfsClient {
   private authHeader: string;
   private debug: boolean;
   private logger: Logger;
+  private store?: LfsPartStore;
+  /** Serializes whole-object downloads so chunk parallelism stays bounded. */
+  private downloadChain: Promise<unknown> = Promise.resolve();
 
   /** `endpoint` = `https://github.com/{owner}/{repo}.git/info/lfs` (no trailing slash). */
-  constructor(endpoint: string, token: string, debug: boolean = false) {
+  constructor(endpoint: string, token: string, debug: boolean = false, store?: LfsPartStore) {
     this.endpoint = endpoint.replace(/\/+$/, '');
     this.authHeader = `Basic ${btoa(`x-access-token:${token}`)}`;
     this.debug = debug;
     this.logger = new Logger('LfsClient', debug ? LogLevel.DEBUG : LogLevel.INFO);
+    this.store = store;
   }
 
   private log(...args: unknown[]): void {
@@ -184,9 +230,18 @@ export class GitHubLfsClient {
 
   /**
    * Download one object via batch download + GET. Verifies sha256 and size.
+   * Large objects are fetched as parallel HTTP Range chunks; when a part store
+   * is configured the download resumes from surviving chunks after a failure.
    * Throws on integrity mismatch — never returns corrupt bytes.
    */
   async download(oid: string, size: number): Promise<ArrayBuffer> {
+    const run = () => this.downloadUnqueued(oid, size);
+    const p = this.downloadChain.then(run, run);
+    this.downloadChain = p.catch(() => undefined);
+    return p;
+  }
+
+  private async downloadUnqueued(oid: string, size: number): Promise<ArrayBuffer> {
     const results = await this.batch('download', [{ oid, size }]);
     const obj = results.find(r => r.oid === oid);
     if (!obj) {
@@ -201,17 +256,135 @@ export class GitHubLfsClient {
       throw new Error(`LFS download: no download action for ${oid}`);
     }
 
-    const data = await this.transfer('GET', downloadAction, undefined, oid);
+    const data = size > CHUNK_SIZE
+      ? await this.downloadChunked(downloadAction, oid, size)
+      : await this.transfer('GET', downloadAction, undefined, oid);
 
     if (data.byteLength !== size) {
       throw new Error(`LFS integrity check failed for ${oid}: size mismatch (expected ${size}, got ${data.byteLength})`);
     }
     const computed = await sha256Hex(data);
     if (computed !== oid) {
+      // Corrupt bytes must not resume from stale parts
+      await this.store?.clearParts(oid);
       throw new Error(`LFS integrity check failed for ${oid}: hash mismatch (got ${computed})`);
     }
+    await this.store?.clearParts(oid);
     this.log(`downloaded ${oid.substring(0, 8)} (${size}B)`);
     return data;
+  }
+
+  private expectedChunkSize(index: number, size: number): number {
+    const start = index * CHUNK_SIZE;
+    return Math.min(CHUNK_SIZE, size - start);
+  }
+
+  /**
+   * Parallel Range download. Falls back to a single GET when the endpoint
+   * returns 200 for a ranged request (Range unsupported).
+   */
+  private async downloadChunked(action: LfsTransferAction, oid: string, size: number): Promise<ArrayBuffer> {
+    const totalChunks = Math.ceil(size / CHUNK_SIZE);
+    const chunks = new Array<ArrayBuffer | null>(totalChunks).fill(null);
+
+    // Resume: keep any part whose byte length matches the expected chunk
+    if (this.store) {
+      for (let i = 0; i < totalChunks; i++) {
+        const saved = await this.store.readPart(oid, i);
+        if (saved && saved.byteLength === this.expectedChunkSize(i, size)) {
+          chunks[i] = saved;
+        }
+      }
+      const reused = chunks.filter(c => c !== null).length;
+      if (reused > 0) {
+        this.log(`resuming ${oid.substring(0, 8)}: ${reused}/${totalChunks} chunks already on disk`);
+      }
+    }
+
+    const missing: number[] = [];
+    for (let i = 0; i < totalChunks; i++) {
+      if (chunks[i] === null) missing.push(i);
+    }
+
+    try {
+      await mapLimit(missing, CHUNK_CONCURRENCY, async (i) => {
+        const start = i * CHUNK_SIZE;
+        const end = start + this.expectedChunkSize(i, size) - 1;
+        const part = await this.rangeGet(action, start, end, oid);
+        chunks[i] = part;
+        if (this.store) {
+          await this.store.writePart(oid, i, part);
+        }
+      });
+    } catch (e) {
+      if (e instanceof RangeNotSupportedError) {
+        this.log(`Range unsupported for ${oid.substring(0, 8)}, falling back to single GET`);
+        await this.store?.clearParts(oid);
+        return this.transfer('GET', action, undefined, oid);
+      }
+      throw e;
+    }
+
+    const out = new Uint8Array(size);
+    let offset = 0;
+    for (const part of chunks) {
+      if (!part) {
+        throw new Error(`LFS chunked download incomplete for ${oid.substring(0, 8)}`);
+      }
+      out.set(new Uint8Array(part), offset);
+      offset += part.byteLength;
+    }
+    return out.buffer;
+  }
+
+  /** One Range GET. Retries once on network failure / 5xx. */
+  private async rangeGet(
+    action: LfsTransferAction,
+    start: number,
+    end: number,
+    oid: string
+  ): Promise<ArrayBuffer> {
+    const expected = end - start + 1;
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < TRANSFER_ATTEMPTS; attempt++) {
+      try {
+        const response = await requestUrl({
+          url: action.href,
+          method: 'GET',
+          headers: {
+            'Accept': 'application/vnd.git-lfs',
+            'Range': `bytes=${start}-${end}`,
+            ...(action.header ?? {}),
+          },
+          throw: false,
+        });
+
+        if (response.status === 206) {
+          const buf = response.arrayBuffer ?? new ArrayBuffer(0);
+          if (buf.byteLength !== expected) {
+            throw new Error(
+              `LFS range ${start}-${end} size mismatch for ${oid.substring(0, 8)}: expected ${expected}, got ${buf.byteLength}`
+            );
+          }
+          return buf;
+        }
+        if (response.status === 200) {
+          throw new RangeNotSupportedError();
+        }
+        lastError = new Error(
+          `LFS range GET failed with status ${response.status} for ${oid.substring(0, 8)} (${start}-${end})`
+        );
+        // 5xx retryable; 416/other 4xx are not
+        if (response.status < 500) throw lastError;
+      } catch (err) {
+        if (err instanceof RangeNotSupportedError) throw err;
+        lastError = err instanceof Error ? err : new Error(getErrorMessage(err));
+        if (attempt === TRANSFER_ATTEMPTS - 1) throw lastError;
+      }
+      this.log(`LFS range retry ${attempt + 1} for ${oid.substring(0, 8)} (${start}-${end})`);
+    }
+    throw lastError ?? new Error(`LFS range GET failed for ${oid}`);
   }
 
   /** Basic transfer adapter. One retry on network failure / 5xx. */

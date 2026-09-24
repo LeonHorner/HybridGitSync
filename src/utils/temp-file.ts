@@ -42,8 +42,19 @@ export class TempFileManager {
    * This ensures atomic writes - either the full file is written or nothing
    */
   async writeSafe(path: string, content: string | ArrayBuffer): Promise<void> {
-    const tempPath = this.getTempPath(path);
     const contentSize = content instanceof ArrayBuffer ? content.byteLength : content.length;
+
+    // Large binaries skip the temp round-trip (write → read → write). The
+    // buffer is already fully in memory and LFS callers verify the hash
+    // before writing, so the extra copy only costs I/O.
+    if (content instanceof ArrayBuffer && contentSize > 1024 * 1024) {
+      await this.ensureParentDir(path);
+      await this.vault.adapter.writeBinary(path, content);
+      this.logger.info(`Direct write completed: ${path} (${contentSize} bytes)`);
+      return;
+    }
+
+    const tempPath = this.getTempPath(path);
     this.logger.info(`Safe write: ${path} (${contentSize} bytes) -> temp: ${tempPath}`);
 
     try {
@@ -57,14 +68,7 @@ export class TempFileManager {
       this.logger.debug('Step 1: Done');
 
       // Step 2: Ensure parent directory exists for final path
-      const dir = path.substring(0, path.lastIndexOf('/'));
-      if (dir) {
-        try {
-          await this.vault.adapter.mkdir(dir);
-        } catch {
-          // Directory may already exist
-        }
-      }
+      await this.ensureParentDir(path);
 
       // Step 3: Read from temp and write to final location
       // (Obsidian adapter doesn't have rename, so we copy)
@@ -92,6 +96,17 @@ export class TempFileManager {
         // Ignore cleanup errors
       }
       throw error;
+    }
+  }
+
+  private async ensureParentDir(path: string): Promise<void> {
+    const dir = path.substring(0, path.lastIndexOf('/'));
+    if (dir) {
+      try {
+        await this.vault.adapter.mkdir(dir);
+      } catch {
+        // Directory may already exist
+      }
     }
   }
 
