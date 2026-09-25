@@ -346,11 +346,14 @@ export class GitBackend extends SyncBackend {
   }
 
   private getExecFile(): typeof import('child_process').execFile {
-    // SAFETY: This method is only called on desktop — callers check Platform.isDesktop first.
-    // child_process is listed in esbuild "external" so it is never bundled;
-    // require() resolves it from Electron's Node.js runtime.
+    // Node.js built-ins are unavailable on mobile, so refuse before touching
+    // require(). child_process is "external" in esbuild and never bundled;
+    // require() resolves it from Electron's Node.js runtime at call time.
+    if (!Platform.isDesktop) {
+      throw new Error('GitBackend requires desktop: Node.js child_process is unavailable on mobile');
+    }
     // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional require() for desktop-only Node.js child_process
-    const cp = require('child_process'); // eslint-disable-line no-restricted-imports -- guarded by Platform.isDesktop callers
+    const cp = require('child_process'); // eslint-disable-line no-restricted-imports -- guarded by Platform.isDesktop above
     return cp.execFile;
   }
 
