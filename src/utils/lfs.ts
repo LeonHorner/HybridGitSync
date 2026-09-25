@@ -54,7 +54,7 @@ const TRANSFER_ATTEMPTS = 4;
 const RETRY_BASE_DELAY_MS = 1000;
 
 function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(resolve => window.setTimeout(resolve, ms));
 }
 
 /**
@@ -146,7 +146,7 @@ export function isLfsPointerText(text: string): boolean {
 /** Lowercase hex sha256 of raw bytes (or UTF-8 bytes of a string). */
 export async function sha256Hex(data: ArrayBuffer | string): Promise<string> {
   const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', bytes as unknown as BufferSource);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', bytes);
   return Array.from(new Uint8Array(hashBuffer))
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
