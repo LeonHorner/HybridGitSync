@@ -34,18 +34,28 @@ const POINTER_MAX_BYTES = 1024;
 const OID_RE = /^[0-9a-f]{64}$/;
 
 /** Below this, one GET is cheaper than several Range handshakes. */
-const SINGLE_GET_MAX = 1024 * 1024;
+const SINGLE_GET_MAX = 512 * 1024;
 /** Aim for this many Range chunks — enough parallelism, few round-trips. */
-const TARGET_CHUNKS = 5;
-/** Floor: smaller chunks only add handshake latency on slow links. */
-const MIN_CHUNK = 1024 * 1024;
-/** Ceiling: keeps retry/resume granularity reasonable on huge objects. */
-const MAX_CHUNK = 16 * 1024 * 1024;
+const TARGET_CHUNKS = 8;
+/**
+ * Floor. `requestUrl` buffers a whole response, so a request that dies at 90%
+ * loses everything: on slow links short chunks are cheaper than long retries.
+ */
+const MIN_CHUNK = 256 * 1024;
+/** Ceiling: caps how much work one failed request can lose. */
+const MAX_CHUNK = 4 * 1024 * 1024;
 /** Parallel Range requests per object (file-level downloads are serialized). */
 const CHUNK_CONCURRENCY = 3;
-/** Extra parallelism once an object is split into many chunks (slow links). */
+/** Extra parallelism once an object is split into many chunks. */
 const CHUNK_CONCURRENCY_LARGE = 4;
-const TRANSFER_ATTEMPTS = 2;
+/** Attempts per request — slow/lossy links need patience, not speed. */
+const TRANSFER_ATTEMPTS = 4;
+/** Base backoff; grows as `base * 2^attempt`. */
+const RETRY_BASE_DELAY_MS = 1000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 /**
  * Range-chunk size derived from the object's total size. A pure function of
@@ -303,7 +313,9 @@ export class GitHubLfsClient {
 
   /**
    * Parallel Range download. Falls back to a single GET when the endpoint
-   * returns 200 for a ranged request (Range unsupported).
+   * returns 200 for a ranged request (Range unsupported). If the parallel wave
+   * fails on a flaky link (HTTP/2 resets are common on slow routes), the
+   * surviving parts are kept and the rest is fetched one chunk at a time.
    */
   private async downloadChunked(action: LfsTransferAction, oid: string, size: number, chunkSize: number): Promise<ArrayBuffer> {
     const totalChunks = Math.ceil(size / chunkSize);
@@ -327,29 +339,51 @@ export class GitHubLfsClient {
       }
     }
 
-    const missing: number[] = [];
-    for (let i = 0; i < totalChunks; i++) {
-      if (chunks[i] === null) missing.push(i);
-    }
-
-    try {
-      await mapLimit(missing, concurrency, async (i) => {
-        const start = i * chunkSize;
-        const end = start + this.expectedChunkSize(i, size, chunkSize) - 1;
-        const part = await this.rangeGet(action, start, end, oid);
-        chunks[i] = part;
-        if (this.store) {
-          await this.store.writePart(oid, i, part);
-        }
-      });
-    } catch (e) {
-      if (e instanceof RangeNotSupportedError) {
-        this.log(`Range unsupported for ${oid.substring(0, 8)}, falling back to single GET`);
-        await this.store?.clearParts(oid);
-        return this.transfer('GET', action, undefined, oid);
+    const missingOf = (): number[] => {
+      const missing: number[] = [];
+      for (let i = 0; i < totalChunks; i++) {
+        if (chunks[i] === null) missing.push(i);
       }
-      throw e;
+      return missing;
+    };
+
+    const fetchChunk = async (i: number): Promise<void> => {
+      const start = i * chunkSize;
+      const end = start + this.expectedChunkSize(i, size, chunkSize) - 1;
+      const part = await this.rangeGet(action, start, end, oid);
+      chunks[i] = part;
+      if (this.store) {
+        await this.store.writePart(oid, i, part);
+      }
+    };
+
+    // Returns null on success, or the error that stopped the wave.
+    const runWave = async (indices: number[], limit: number): Promise<Error | null> => {
+      try {
+        await mapLimit(indices, limit, fetchChunk);
+        return null;
+      } catch (e) {
+        return e instanceof Error ? e : new Error(getErrorMessage(e));
+      }
+    };
+
+    let err = await runWave(missingOf(), concurrency);
+    if (err && !(err instanceof RangeNotSupportedError)) {
+      const remaining = missingOf();
+      if (remaining.length > 0) {
+        this.log(
+          `parallel wave failed for ${oid.substring(0, 8)} (${getErrorMessage(err)}); ` +
+          `retrying ${remaining.length} chunk(s) sequentially`
+        );
+        err = await runWave(remaining, 1);
+      }
     }
+    if (err instanceof RangeNotSupportedError) {
+      this.log(`Range unsupported for ${oid.substring(0, 8)}, falling back to single GET`);
+      await this.store?.clearParts(oid);
+      return this.transfer('GET', action, undefined, oid);
+    }
+    if (err) throw err;
 
     const out = new Uint8Array(size);
     let offset = 0;
@@ -363,7 +397,7 @@ export class GitHubLfsClient {
     return out.buffer;
   }
 
-  /** One Range GET. Retries once on network failure / 5xx. */
+  /** One Range GET. Retries on network failure / 5xx with exponential backoff. */
   private async rangeGet(
     action: LfsTransferAction,
     start: number,
@@ -408,22 +442,23 @@ export class GitHubLfsClient {
         lastError = err instanceof Error ? err : new Error(getErrorMessage(err));
         if (attempt === TRANSFER_ATTEMPTS - 1) throw lastError;
       }
-      this.log(`LFS range retry ${attempt + 1} for ${oid.substring(0, 8)} (${start}-${end})`);
+      const wait = RETRY_BASE_DELAY_MS * 2 ** attempt;
+      this.log(`LFS range retry ${attempt + 1} in ${wait}ms for ${oid.substring(0, 8)} (${start}-${end})`);
+      await delay(wait);
     }
     throw lastError ?? new Error(`LFS range GET failed for ${oid}`);
   }
 
-  /** Basic transfer adapter. One retry on network failure / 5xx. */
+  /** Basic transfer adapter. Retries on network failure / 5xx with backoff. */
   private async transfer(
     method: 'PUT' | 'GET',
     action: LfsTransferAction,
     body: ArrayBuffer | undefined,
     oid: string
   ): Promise<ArrayBuffer> {
-    const maxAttempts = 2;
     let lastError: Error | null = null;
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    for (let attempt = 0; attempt < TRANSFER_ATTEMPTS; attempt++) {
       try {
         const response = await requestUrl({
           url: action.href,
@@ -447,9 +482,11 @@ export class GitHubLfsClient {
         }
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(getErrorMessage(err));
-        if (attempt === maxAttempts - 1) throw lastError;
+        if (attempt === TRANSFER_ATTEMPTS - 1) throw lastError;
       }
-      this.log(`LFS ${method} retry ${attempt + 1} for ${oid.substring(0, 8)}`);
+      const wait = RETRY_BASE_DELAY_MS * 2 ** attempt;
+      this.log(`LFS ${method} retry ${attempt + 1} in ${wait}ms for ${oid.substring(0, 8)}`);
+      await delay(wait);
     }
     throw lastError ?? new Error(`LFS ${method} failed for ${oid}`);
   }
