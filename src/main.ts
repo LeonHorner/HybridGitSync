@@ -286,7 +286,7 @@ export default class HybridGitSyncPlugin extends Plugin {
       const tempBackend = new GitBackend(this.app.vault, this.settings.gitPath, '', '', '', this.settings.debug);
       const available = await tempBackend.isAvailable();
       this.log('isGitAvailable: GitBackend.isAvailable =', available);
-      if (!available) {
+      if (!available && this.settings.debug) {
         try {
           const v = await tempBackend.exec(['--version']);
           this.log('isGitAvailable probe: git --version =', v.trim());
