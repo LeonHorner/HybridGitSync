@@ -1876,16 +1876,24 @@ export class ApiBackend extends SyncBackend {
       // For empty files, return immediately (avoids download_url throwing on empty response)
       if (data.size === 0) {
         content = isBinary ? new ArrayBuffer(0) : '';
-      } else if (!data.content && data.sha) {
+      } else if (!data.content && data.sha && this.config.provider === 'github') {
         this.log('Large file detected (>1MB), fetching Git blob:', path, 'sha:', data.sha);
         const startTime = Date.now();
         try {
-          const raw = await this.apiRequest<ArrayBuffer>(
+          const timeoutMs = 2 * 60 * 1000;
+          const blobPromise = this.apiRequest<ArrayBuffer>(
             'GET',
             `/repos/${this.config.repo}/git/blobs/${data.sha}`,
             undefined,
             { raw: true }
           );
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            window.setTimeout(() => {
+              this.log(`Blob download timeout after ${timeoutMs}ms for: ${path}`);
+              reject(new Error(`Download timeout after ${timeoutMs / 1000} seconds`));
+            }, timeoutMs);
+          });
+          const raw = await Promise.race([blobPromise, timeoutPromise]);
           const elapsed = Date.now() - startTime;
           this.log(`Downloaded blob for ${path} in ${elapsed}ms (${raw.byteLength} bytes)`);
           content = isBinary ? raw : new TextDecoder('utf-8').decode(raw);
@@ -1944,38 +1952,45 @@ export class ApiBackend extends SyncBackend {
   }
 
   /**
-   * Fallback: Download a file using GitHub/GitLab download_url
+   * Fallback: Download a file using GitHub/GitLab/Gitea/Gitee download_url
    */
   private async downloadViaUrl(downloadUrlStr: string, path: string, isBinary: boolean): Promise<string | ArrayBuffer> {
     this.log('Using download_url:', path);
     const startTime = Date.now();
     try {
       const downloadUrl = encodeURI(downloadUrlStr);
-      const headers: Record<string, string> = {};
-      // Pass Authorization header only if download_url does not already include token query parameter
-      // (raw.githubusercontent.com returns 404 if both token param and Authorization header are present)
-      if (this.config.token && !downloadUrl.includes('token=')) {
-        headers['Authorization'] = `token ${this.config.token}`;
-      }
 
-      const downloadPromise = (async () => {
-        return await requestUrl({
+      const fetchWithTimeout = async (headers: Record<string, string>): Promise<RequestUrlResponse> => {
+        const timeoutMs = 2 * 60 * 1000;
+        const downloadPromise = requestUrl({
           url: downloadUrl,
           method: 'GET',
           headers,
           throw: false,
         });
-      })();
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          window.setTimeout(() => {
+            this.log(`Download timeout after ${timeoutMs}ms for: ${path}`);
+            reject(new Error(`Download timeout after ${timeoutMs / 1000} seconds`));
+          }, timeoutMs);
+        });
+        return await Promise.race([downloadPromise, timeoutPromise]);
+      };
 
-      const timeoutMs = 2 * 60 * 1000;
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        window.setTimeout(() => {
-          this.log(`Download timeout after ${timeoutMs}ms for: ${path}`);
-          reject(new Error(`Download timeout after ${timeoutMs / 1000} seconds`));
-        }, timeoutMs);
-      });
+      // Try unauthenticated first (avoids raw.githubusercontent.com 404 with fine-grained PATs
+      // and works for public repos without token issues)
+      let response = await fetchWithTimeout({});
 
-      const response = await Promise.race([downloadPromise, timeoutPromise]);
+      // If unauthenticated fails with 401, 403, or 404, retry with auth header if token is available
+      if ((response.status === 401 || response.status === 403 || response.status === 404) &&
+          this.config.token && !downloadUrl.includes('token=')) {
+        const authScheme = (this.config.provider === 'gitlab' || this.config.provider === 'gitee') ? 'Bearer' : 'token';
+        this.log(`download_url unauthenticated request returned status ${response.status}, retrying with ${authScheme} auth`);
+        response = await fetchWithTimeout({
+          'Authorization': `${authScheme} ${this.config.token}`,
+        });
+      }
+
       const elapsed = Date.now() - startTime;
       this.log(`Download completed in ${elapsed}ms, status:`, response.status);
 
@@ -3028,7 +3043,7 @@ export class ApiBackend extends SyncBackend {
     method: string,
     path: string,
     body?: Record<string, unknown>,
-    options?: { raw?: boolean; silentNotFound?: boolean; headers?: Record<string, string> }
+    options?: { raw?: boolean; silentNotFound?: boolean }
   ): Promise<T> {
     const [pathPart, queryPart] = path.split('?');
     // Segments already containing '%' are pre-encoded (e.g. GitLab project ids
@@ -3051,7 +3066,6 @@ export class ApiBackend extends SyncBackend {
       'Authorization': `token ${this.config.token}`,
       'Content-Type': 'application/json',
       'Accept': defaultAccept,
-      ...options?.headers,
     };
 
     if (this.config.provider === 'gitlab' || this.config.provider === 'gitee') {
