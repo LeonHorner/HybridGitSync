@@ -1873,66 +1873,39 @@ export class ApiBackend extends SyncBackend {
       const isBinary = isBinaryFile(path);
       let content: string | ArrayBuffer;
 
-      // For large files (>1MB), content may be empty - use download_url with proper encoding
-      if (!data.content && data.download_url) {
-        this.log('Large file detected, using download_url:', path);
-        this.log('File size:', data.size, 'bytes');
+      // For empty files, return immediately (avoids download_url throwing on empty response)
+      if (data.size === 0) {
+        content = isBinary ? new ArrayBuffer(0) : '';
+      } else if (!data.content && data.sha && this.config.provider === 'github') {
+        this.log('Large file detected (>1MB), fetching Git blob:', path, 'sha:', data.sha);
         const startTime = Date.now();
         try {
-          // Encode the download_url properly to handle Chinese characters
-          const downloadUrl = encodeURI(data.download_url);
-          this.log('Encoded download URL:', downloadUrl);
-
-          this.log('Starting download...');
-
-          // Create a wrapper to track download progress
-          const downloadPromise = (async () => {
-            try {
-              const result = await requestUrl({
-                url: downloadUrl,
-                method: 'GET',
-                throw: false,
-              });
-              return result;
-            } catch (err) {
-              this.log('requestUrl threw error:', err);
-              throw err;
-            }
-          })();
-
-          // 2 minute timeout for large files (Obsidian may have shorter internal timeout)
           const timeoutMs = 2 * 60 * 1000;
+          const blobPromise = this.apiRequest<ArrayBuffer>(
+            'GET',
+            `/repos/${this.config.repo}/git/blobs/${data.sha}`,
+            undefined,
+            { raw: true }
+          );
           const timeoutPromise = new Promise<never>((_, reject) => {
             window.setTimeout(() => {
-              this.log(`Download timeout after ${timeoutMs}ms for: ${path}`);
+              this.log(`Blob download timeout after ${timeoutMs}ms for: ${path}`);
               reject(new Error(`Download timeout after ${timeoutMs / 1000} seconds`));
             }, timeoutMs);
           });
-
-          const response = await Promise.race([downloadPromise, timeoutPromise]);
+          const raw = await Promise.race([blobPromise, timeoutPromise]);
           const elapsed = Date.now() - startTime;
-          this.log(`Download completed in ${elapsed}ms`);
-
-          this.log('Download response status:', response.status);
-          if (response.status >= 400) {
-            this.log('Download response text:', response.text?.substring(0, 500));
-            throw new Error(`Download failed with status ${response.status}: ${path}`);
+          this.log(`Downloaded blob for ${path} in ${elapsed}ms (${raw.byteLength} bytes)`);
+          content = isBinary ? raw : new TextDecoder('utf-8').decode(raw);
+        } catch (blobError) {
+          this.log('Git blob API failed, falling back to download_url:', blobError);
+          if (!data.download_url) {
+            throw blobError;
           }
-          const responseSize = response.arrayBuffer?.byteLength || response.text?.length || 0;
-          this.log('Download response size:', responseSize, 'bytes');
-          if (responseSize === 0) {
-            throw new Error('Download response is empty');
-          }
-          if (isBinary) {
-            content = response.arrayBuffer;
-          } else {
-            content = response.text;
-          }
-        } catch (downloadError) {
-          const elapsed = Date.now() - startTime;
-          console.error(`[HybridGitSync] Download failed for ${path} after ${elapsed}ms:`, downloadError);
-          throw new Error(`Failed to download large file: ${getErrorMessage(downloadError)}`);
+          content = await this.downloadViaUrl(data.download_url, path, isBinary);
         }
+      } else if (!data.content && data.download_url) {
+        content = await this.downloadViaUrl(data.download_url, path, isBinary);
       } else if (data.encoding === 'base64') {
         try {
           if (isBinary) {
@@ -1975,6 +1948,64 @@ export class ApiBackend extends SyncBackend {
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes('404')) return null;
       throw error;
+    }
+  }
+
+  /**
+   * Fallback: Download a file using GitHub/GitLab/Gitea/Gitee download_url
+   */
+  private async downloadViaUrl(downloadUrlStr: string, path: string, isBinary: boolean): Promise<string | ArrayBuffer> {
+    this.log('Using download_url:', path);
+    const startTime = Date.now();
+    try {
+      const downloadUrl = encodeURI(downloadUrlStr);
+
+      const fetchWithTimeout = async (headers: Record<string, string>): Promise<RequestUrlResponse> => {
+        const timeoutMs = 2 * 60 * 1000;
+        const downloadPromise = requestUrl({
+          url: downloadUrl,
+          method: 'GET',
+          headers,
+          throw: false,
+        });
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          window.setTimeout(() => {
+            this.log(`Download timeout after ${timeoutMs}ms for: ${path}`);
+            reject(new Error(`Download timeout after ${timeoutMs / 1000} seconds`));
+          }, timeoutMs);
+        });
+        return await Promise.race([downloadPromise, timeoutPromise]);
+      };
+
+      // Try unauthenticated first (avoids raw.githubusercontent.com 404 with fine-grained PATs
+      // and works for public repos without token issues)
+      let response = await fetchWithTimeout({});
+
+      // If unauthenticated fails with 401, 403, or 404, retry with auth header if token is available
+      if ((response.status === 401 || response.status === 403 || response.status === 404) &&
+          this.config.token && !downloadUrl.includes('token=')) {
+        const authScheme = (this.config.provider === 'gitlab' || this.config.provider === 'gitee') ? 'Bearer' : 'token';
+        this.log(`download_url unauthenticated request returned status ${response.status}, retrying with ${authScheme} auth`);
+        response = await fetchWithTimeout({
+          'Authorization': `${authScheme} ${this.config.token}`,
+        });
+      }
+
+      const elapsed = Date.now() - startTime;
+      this.log(`Download completed in ${elapsed}ms, status:`, response.status);
+
+      if (response.status >= 400) {
+        throw new Error(`Download failed with status ${response.status}: ${path}`);
+      }
+      const responseSize = response.arrayBuffer?.byteLength || response.text?.length || 0;
+      if (responseSize === 0) {
+        throw new Error('Download response is empty');
+      }
+      return isBinary ? response.arrayBuffer : response.text;
+    } catch (downloadError) {
+      const elapsed = Date.now() - startTime;
+      console.error(`[HybridGitSync] Download failed for ${path} after ${elapsed}ms:`, downloadError);
+      throw new Error(`Failed to download large file: ${getErrorMessage(downloadError)}`);
     }
   }
 
@@ -2070,6 +2101,12 @@ export class ApiBackend extends SyncBackend {
       this.log('batchCommitWithGitDataApi: creating tree...');
       const tree = await this.createTree(treeEntries, baseTreeSha || undefined);
       this.log('batchCommitWithGitDataApi: created tree', tree);
+
+      // If tree is unchanged from base tree, avoid creating an empty commit
+      if (baseTreeSha && tree === baseTreeSha) {
+        this.log('batchCommitWithGitDataApi: tree unchanged from base tree, skipping commit');
+        return { success: true };
+      }
 
       // Step 5: Create commit
       this.log('batchCommitWithGitDataApi: creating commit...');
@@ -3021,10 +3058,14 @@ export class ApiBackend extends SyncBackend {
 
     this.log('apiRequest:', method, url);
 
+    const defaultAccept = options?.raw
+      ? (this.config.provider === 'github' ? 'application/vnd.github.v3.raw' : '*/*')
+      : 'application/json';
+
     const headers: Record<string, string> = {
       'Authorization': `token ${this.config.token}`,
       'Content-Type': 'application/json',
-      'Accept': 'application/json',
+      'Accept': defaultAccept,
     };
 
     if (this.config.provider === 'gitlab' || this.config.provider === 'gitee') {
