@@ -19,15 +19,18 @@ export class GitBackend extends SyncBackend {
   constructor(vault: Vault, gitPath: string = 'git', remoteUrl: string = '', token: string = '', commitMessage?: string, debug = false) {
     super();
     // The vault's absolute path lives on the desktop-only FileSystemAdapter
-    const adapter = vault.adapter as any;
-    if (typeof adapter?.getBasePath === 'function') {
-      this.vaultPath = adapter.getBasePath();
-    } else if (typeof adapter?.basePath === 'string') {
-      this.vaultPath = adapter.basePath;
-    } else if (vault.adapter instanceof FileSystemAdapter) {
+    if (vault.adapter instanceof FileSystemAdapter) {
       this.vaultPath = vault.adapter.getBasePath();
     } else {
-      this.vaultPath = '';
+      // Fallback for alternative adapters exposing a base path
+      const adapter = vault.adapter as Partial<FileSystemAdapter> & { basePath?: string };
+      if (typeof adapter.getBasePath === 'function') {
+        this.vaultPath = adapter.getBasePath();
+      } else if (typeof adapter.basePath === 'string') {
+        this.vaultPath = adapter.basePath;
+      } else {
+        this.vaultPath = '';
+      }
     }
     this.configuredGitPath = gitPath;
     this.remoteUrl = remoteUrl;
